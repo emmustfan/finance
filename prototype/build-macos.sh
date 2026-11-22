@@ -14,7 +14,6 @@ if (( ${macos_version%%.*} < 13 )); then
 fi
 
 python3.12 -m venv .venv
-.venv/bin/python -c 'import tkinter'
 .venv/bin/python -m pip install --only-binary=:all: -r requirements.txt PyInstaller==6.18.0
 .venv/bin/python -m PyInstaller --noconfirm --windowed \
     --name FinanceArchive --osx-bundle-identifier org.familyfinance.archive \

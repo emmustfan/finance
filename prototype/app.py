@@ -1,212 +1,562 @@
+"""Desktop entry point for the encrypted family archive."""
+
 import subprocess
-import tkinter as tk
-from tkinter import font
+import sys
 from pathlib import Path
-from tkinter import filedialog, messagebox, simpledialog, ttk
 
 import pypdfium2 as pdfium
 from cryptography.exceptions import InvalidTag
-from PIL import ImageTk
+from PySide6.QtCore import QSize, Qt, QTimer
+from PySide6.QtGui import QAction, QKeySequence, QPixmap, QShortcut
+from PySide6.QtWidgets import (
+    QApplication, QComboBox, QDialog, QFileDialog, QFrame, QHBoxLayout, QInputDialog,
+    QLabel, QLineEdit, QListWidget, QListWidgetItem, QMainWindow, QMenu, QMessageBox,
+    QPushButton, QScrollArea, QSizePolicy, QSplitter, QToolButton, QVBoxLayout, QWidget,
+)
+from PIL.ImageQt import ImageQt
 
+from appearance import TagEditor, TagFlow, apply_style, clear_tags, tag_button
 from documents import CARD_FIELDS, Card, Catalog, read_pdf, tag_names
 from sample import sample_pdf
 from vault import copy_verified
 
-VAULT_TYPES = [("Архив", "*.fvault")]
+VAULT_FILTER = "Семейный архив (*.fvault)"
 
 
-def configure_appearance(root: tk.Tk) -> None:
-    style = ttk.Style(root)
-    style.theme_use("clam")
-    system = root.tk.call("tk", "windowingsystem")
-    preferred = {"aqua": "Helvetica Neue", "x11": "DejaVu Sans"}.get(system)
-    family = font.nametofont("TkDefaultFont", root=root).actual("family")
-    if preferred in font.families(root):
-        family = preferred
-    for name, size, weight in (
-        ("TkDefaultFont", 12, "normal"), ("TkTextFont", 12, "normal"),
-        ("ArchiveTitleFont", 22, "bold"), ("DocumentTitleFont", 20, "bold"),
-        ("SectionFont", 12, "bold"),
-    ):
-        try:
-            typeface = font.nametofont(name, root=root)
-        except tk.TclError:
-            typeface = font.Font(root=root, name=name, exists=False)
-            typeface.delete_font = False
-        typeface.configure(family=family, size=size, weight=weight)
-    surface, background, ink, muted = "#FFFFFF", "#EEF2F8", "#152638", "#496075"
-    root.configure(background=background)
-    style.configure(".", background=surface, foreground=ink, font="TkDefaultFont")
-    style.configure("Workspace.TFrame", background=background)
-    style.configure("ArchiveTitle.TLabel", font="ArchiveTitleFont")
-    style.configure("DocumentTitle.TLabel", font="DocumentTitleFont")
-    style.configure("Section.TLabel", font="SectionFont")
-    style.configure("Muted.TLabel", foreground=muted)
-    style.configure("Preview.TLabel", background=background)
-    style.configure("TButton", padding=(11, 7), background="#E7EDF5", bordercolor="#CBD6E4")
-    style.map("TButton", background=[("active", "#D8E3F1")], foreground=[("disabled", muted)])
-    style.configure("Primary.TButton", background="#2054BB", foreground="#FFFFFF", bordercolor="#2054BB")
-    style.map("Primary.TButton",
-              background=[("disabled", "#E7EDF5"), ("active", "#173F92")],
-              foreground=[("disabled", muted), ("!disabled", "#FFFFFF")])
-    style.configure("TEntry", padding=6, fieldbackground=surface, insertcolor=ink)
-    style.configure("TCombobox", padding=5, fieldbackground=surface, insertcolor=ink)
-    style.map("TCombobox", fieldbackground=[("readonly", surface)], foreground=[("readonly", ink)])
-    style.configure("Treeview", rowheight=34, background=surface, fieldbackground=surface)
-    style.configure("Treeview.Heading", padding=6, background="#E7EDF5", font="SectionFont")
-    style.map("Treeview", background=[("selected", "#DCE9FF")], foreground=[("selected", "#153976")])
+def label(text="", style="", *, wrap=False) -> QLabel:
+    widget = QLabel(text)
+    widget.setObjectName(style)
+    widget.setTextFormat(Qt.TextFormat.PlainText)
+    widget.setWordWrap(wrap)
+    return widget
 
 
-class ArchiveWindow:
-    def __init__(self, root: tk.Tk) -> None:
-        self.root = root
-        self.pdf: bytes | None = None
+def button(text, action, *, primary=False, sidebar=False) -> QPushButton:
+    widget = QPushButton(text)
+    widget.setProperty("primary", primary)
+    widget.setProperty("sidebar", sidebar)
+    widget.setAutoDefault(False)
+    widget.setCursor(Qt.CursorShape.PointingHandCursor)
+    widget.clicked.connect(action)
+    return widget
+
+
+def frame(style, parent=None) -> QFrame:
+    widget = QFrame(parent)
+    widget.setObjectName(style)
+    return widget
+
+
+def area(widget) -> QScrollArea:
+    view = QScrollArea()
+    view.setWidget(widget)
+    view.setWidgetResizable(True)
+    view.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+    return view
+
+
+class PdfPreview(QFrame):
+    def __init__(self, report_error, parent=None):
+        super().__init__(parent)
+        self.setObjectName("preview")
+        self.report_error = report_error
         self.document = None
-        self.image = None
+        self.data = None
         self.page = 0
-        self.preview_resize = None
+        self.fit_timer = QTimer(self)
+        self.fit_timer.setSingleShot(True)
+        self.fit_timer.setInterval(90)
+        self.fit_timer.timeout.connect(self.render)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(12, 12, 12, 12)
+        self.image = label("Выберите документ с PDF", "muted")
+        self.image.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.image.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Ignored)
+        self.image.setMinimumHeight(130)
+        layout.addWidget(self.image, 1)
+        controls = QHBoxLayout()
+        self.previous = button("‹", lambda: self.move(-1))
+        self.previous.setAccessibleName("Предыдущая страница")
+        self.previous.setToolTip(self.previous.accessibleName())
+        self.next = button("›", lambda: self.move(1))
+        self.next.setAccessibleName("Следующая страница")
+        self.next.setToolTip(self.next.accessibleName())
+        self.page_label = label(style="muted")
+        self.print_button = button("Печать PDF", self.print_pdf)
+        controls.addWidget(self.previous)
+        controls.addWidget(self.next)
+        controls.addWidget(self.page_label)
+        controls.addStretch(1)
+        controls.addWidget(self.print_button)
+        layout.addLayout(controls)
+        self.set_pdf(None, "Выберите документ с PDF")
+
+    def set_pdf(self, data: bytes | None, empty="К карточке не прикреплён PDF") -> None:
+        self.fit_timer.stop()
+        if self.document is not None:
+            self.document.close()
+        self.document = None
+        self.data = None
+        self.page = 0
+        self.image.setText(empty)
+        if data is not None:
+            try:
+                doc = pdfium.PdfDocument(data)
+                if not len(doc):
+                    doc.close()
+                    raise ValueError("В PDF нет страниц.")
+            except (ValueError, pdfium.PdfiumError) as exc:
+                self.image.setText("Не удалось открыть PDF")
+                self.report_error(exc)
+            else:
+                self.document, self.data = doc, data
+                self.fit_timer.start()
+        self.update_controls()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if self.document is not None:
+            self.fit_timer.start()
+
+    def update_controls(self) -> None:
+        count = len(self.document) if self.document is not None else 0
+        self.previous.setEnabled(self.page > 0)
+        self.next.setEnabled(self.page + 1 < count)
+        self.print_button.setEnabled(count > 0)
+        self.page_label.setText(f"{self.page + 1} / {count}" if count else "Предпросмотр PDF")
+
+    def move(self, delta: int) -> None:
+        if self.document is not None and 0 <= self.page + delta < len(self.document):
+            self.page += delta
+            self.render()
+            self.update_controls()
+
+    def render(self) -> None:
+        if self.document is None:
+            return
+        try:
+            page = self.document[self.page]
+            try:
+                width, height = page.get_size()
+                if width <= 0 or height <= 0:
+                    raise ValueError("У страницы PDF некорректный размер.")
+                ratio = self.devicePixelRatioF()
+                scale = min(
+                    max(1, self.image.width() - 8) * ratio / width,
+                    max(1, self.image.height() - 8) * ratio / height,
+                    1600 / max(width, height),
+                )
+                bitmap = page.render(scale=scale)
+                try:
+                    pixmap = QPixmap.fromImage(ImageQt(bitmap.to_pil()))
+                    pixmap.setDevicePixelRatio(ratio)
+                    self.image.setPixmap(pixmap)
+                finally:
+                    bitmap.close()
+            finally:
+                page.close()
+        except (ValueError, IndexError, pdfium.PdfiumError) as exc:
+            self.image.setText("Не удалось отобразить страницу")
+            self.page_label.setText(str(exc))
+
+    def print_pdf(self) -> None:
+        if self.data is None:
+            return
+        reply = QMessageBox.question(
+            self, "Печать PDF", "Отправить PDF на принтер по умолчанию?",
+            QMessageBox.StandardButton.Ok | QMessageBox.StandardButton.Cancel,
+        )
+        if reply != QMessageBox.StandardButton.Ok:
+            return
+        try:
+            result = subprocess.run(
+                ["/usr/bin/lp", "-t", "Family archive PDF", "-"],
+                input=self.data, capture_output=True, timeout=30, check=False,
+            )
+            if result.returncode:
+                raise RuntimeError(result.stderr.decode(errors="replace").strip() or "Ошибка CUPS.")
+        except (OSError, RuntimeError, subprocess.TimeoutExpired) as exc:
+            self.report_error(exc)
+            return
+        QMessageBox.information(self, "Печать", "Задание передано в очередь печати.")
+
+
+class DocumentTypeBox(QComboBox):
+    def __init__(self, kinds: tuple[str, ...], value: str):
+        super().__init__()
+        self.setEditable(True)
+        self.addItem("")
+        self.addItems(kinds)
+        self.setCurrentText(value)
+        self.lineEdit().setPlaceholderText("Выберите или впишите свой тип")
+        self.toggle = QToolButton(self)
+        self.toggle.setObjectName("typeToggle")
+        self.toggle.setText("▾")
+        self.toggle.setAccessibleName("Открыть список типов")
+        self.toggle.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.toggle.clicked.connect(self.showPopup)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self.toggle.setGeometry(self.width() - 29, (self.height() - 26) // 2, 25, 26)
+
+
+class CardDialog(QDialog):
+    def __init__(self, parent, kinds: tuple[str, ...], card: Card | None):
+        super().__init__(parent)
+        self.setWindowTitle("Изменить карточку" if card is not None else "Новый документ")
+        self.resize(710, 600)
+        self.pdf = card.pdf if card is not None else None
+        self.card: Card | None = None
+        self.inputs: dict[str, QLineEdit | QComboBox] = {}
+
+        main = QVBoxLayout(self)
+        main.setContentsMargins(24, 20, 24, 20)
+        main.setSpacing(12)
+        main.addWidget(label(self.windowTitle(), "screenTitle"))
+        main.addWidget(label("Укажите название и приложите PDF или запишите, где лежит оригинал.", "muted", wrap=True))
+
+        form = QWidget()
+        form.setObjectName("formContent")
+        form_layout = QHBoxLayout(form)
+        form_layout.setContentsMargins(0, 0, 6, 0)
+        form_layout.setSpacing(18)
+        document = QVBoxLayout()
+        document.setSpacing(9)
+        original = QVBoxLayout()
+        original.setSpacing(9)
+        form_layout.addLayout(document, 1)
+        form_layout.addLayout(original, 1)
+        document.addWidget(label("О документе", "sectionTitle"))
+        for key in ("title", "kind", "number"):
+            document.addLayout(self.field(key, card, kinds))
+        dates = QHBoxLayout()
+        dates.addLayout(self.field("date", card, kinds), 1)
+        dates.addLayout(self.field("expires", card, kinds), 1)
+        document.addLayout(dates)
+        for key in ("party", "note"):
+            document.addLayout(self.field(key, card, kinds))
+        document.addStretch(1)
+
+        original.addWidget(label("Теги", "sectionTitle"))
+        self.tag_editor = TagEditor(card.tags if card is not None else "")
+        original.addWidget(self.tag_editor)
+        self.attachment = label(
+            "PDF прикреплён" if self.pdf is not None else "PDF не выбран", "muted", wrap=True
+        )
+        original.addSpacing(3)
+        original.addWidget(label("Вложение", "sectionTitle"))
+        attachment = QHBoxLayout()
+        attachment.addWidget(button("Выбрать PDF…", self.choose_pdf))
+        attachment.addWidget(self.attachment, 1)
+        original.addLayout(attachment)
+        original.addSpacing(3)
+        original.addWidget(label("Бумажный оригинал", "sectionTitle"))
+        for key in ("cabinet", "folder"):
+            original.addLayout(self.field(key, card, kinds))
+        position = QHBoxLayout()
+        position.addLayout(self.field("section", card, kinds), 1)
+        position.addLayout(self.field("position", card, kinds), 1)
+        original.addLayout(position)
+        original.addStretch(1)
+        main.addWidget(area(form), 1)
+        self.problem = label(style="muted", wrap=True)
+        self.problem.hide()
+        main.addWidget(self.problem)
+        actions = QHBoxLayout()
+        actions.addStretch(1)
+        actions.addWidget(button("Отмена", self.reject))
+        actions.addWidget(button("Сохранить", self.save, primary=True))
+        main.addLayout(actions)
+        self.inputs["title"].setFocus()
+
+    def field(self, key: str, card: Card | None, kinds: tuple[str, ...]) -> QVBoxLayout:
+        title = dict(CARD_FIELDS)[key]
+        value = getattr(card, key) if card is not None else ""
+        if key == "kind":
+            field = DocumentTypeBox(kinds, value)
+        else:
+            field = QLineEdit(value)
+        field.setAccessibleName(title)
+        self.inputs[key] = field
+        layout = QVBoxLayout()
+        layout.setSpacing(3)
+        layout.addWidget(label(title))
+        layout.addWidget(field)
+        return layout
+
+    def choose_pdf(self) -> None:
+        filename, _ = QFileDialog.getOpenFileName(self, "Выберите PDF", "", "PDF (*.pdf)")
+        if not filename:
+            return
+        try:
+            path = Path(filename)
+            data = read_pdf(path)
+            with pdfium.PdfDocument(data) as doc:
+                if not len(doc):
+                    raise ValueError("В PDF нет страниц.")
+        except (OSError, ValueError, pdfium.PdfiumError) as exc:
+            QMessageBox.warning(self, "Не удалось приложить PDF", str(exc))
+            return
+        self.pdf = data
+        self.attachment.setText(path.name)
+
+    def save(self) -> None:
+        values = {
+            key: (widget.currentText() if isinstance(widget, QComboBox) else widget.text()).strip()
+            for key, widget in self.inputs.items()
+        }
+        card = Card(**values, tags=self.tag_editor.value(), pdf=self.pdf)
+        try:
+            card.validate()
+        except ValueError as exc:
+            self.problem.setText(str(exc))
+            self.problem.show()
+            return
+        self.card = card
+        self.accept()
+
+
+class TagDialog(QDialog):
+    def __init__(self, parent, existing: str):
+        super().__init__(parent)
+        self.setWindowTitle("Теги документа")
+        self.setMinimumWidth(360)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(22, 20, 22, 20)
+        layout.addWidget(label("Теги документа", "screenTitle"))
+        self.editor = TagEditor(existing)
+        layout.addWidget(self.editor)
+        actions = QHBoxLayout()
+        actions.addStretch(1)
+        actions.addWidget(button("Отмена", self.reject))
+        actions.addWidget(button("Сохранить", self.accept, primary=True))
+        layout.addLayout(actions)
+        self.editor.input.setFocus()
+
+
+class DocumentRow(QWidget):
+    def __init__(self, card: Card, select, filter_tag):
+        super().__init__()
+        self.select = select
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(10, 7, 10, 7)
+        layout.setSpacing(3)
+        title = label(card.title, "rowTitle")
+        title.setToolTip(card.title)
+        title.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        layout.addWidget(title)
+        metadata = label("  ·  ".join(filter(None, (f"№ {card.archive_label}", card.kind))), "small")
+        metadata.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        layout.addWidget(metadata)
+        tags = tag_names(card.tags)
+        if tags:
+            tags_row = QHBoxLayout()
+            tags_row.setSpacing(5)
+            for name in tags[:2]:
+                chip = tag_button(name)
+                chip.setMaximumWidth(116)
+                chip.clicked.connect(lambda _, name=name: filter_tag(name))
+                tags_row.addWidget(chip)
+            if len(tags) > 2:
+                tags_row.addWidget(label(f"+{len(tags) - 2}", "small"))
+            tags_row.addStretch(1)
+            layout.addLayout(tags_row)
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.select()
+        super().mousePressEvent(event)
+
+
+class ArchiveWindow(QMainWindow):
+    def __init__(self):
+        super().__init__()
         self.catalog: Catalog | None = None
-        self.can_edit = False
         self.displayed_card: Card | None = None
+        self.active_tag = ""
+        self.setWindowTitle("Семейный архив")
+        self.resize(1240, 810)
+        self.setMinimumSize(980, 650)
 
-        root.title("Семейный архив")
-        header = ttk.Frame(root, padding=(22, 14))
-        header.pack(fill="x")
-        ttk.Label(header, text="Семейный архив", style="ArchiveTitle.TLabel").pack(side="left")
-        self.archive_name = ttk.Label(
-            header, text="Архив не открыт", style="Muted.TLabel", wraplength=360
-        )
-        self.archive_name.pack(side="left", padx=16)
-        self.close_archive_button = ttk.Button(
-            header, text="Закрыть архив", command=self.close_archive, state="disabled"
-        )
-        self.close_archive_button.pack(side="right")
+        central = QWidget()
+        self.setCentralWidget(central)
+        root = QHBoxLayout(central)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(0)
+        root.addWidget(self.build_sidebar())
 
-        toolbar = ttk.Frame(root, padding=(18, 0, 18, 12))
-        toolbar.pack(fill="x")
-        for label, action in (
-            ("Новый архив", lambda: self.create_archive(False)),
-            ("Открыть архив", self.open_archive),
-            ("Создать копию", lambda: self.copy_archive(False)),
-            ("Восстановить из копии", lambda: self.copy_archive(True)),
-            ("Создать тестовый архив", lambda: self.create_archive(True)),
-        ):
-            ttk.Button(toolbar, text=label, command=action).pack(side="left", padx=3)
+        main = QWidget()
+        main.setObjectName("workspace")
+        layout = QVBoxLayout(main)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+        root.addWidget(main, 1)
+        layout.addWidget(self.build_top_bar())
 
-        body = ttk.Frame(root, padding=14, style="Workspace.TFrame")
-        body.pack(fill="both", expand=True)
-        sidebar = ttk.Frame(body, padding=14)
-        sidebar.pack(side="left", fill="y", padx=(0, 14))
-        ttk.Label(sidebar, text="Документы", style="Section.TLabel").pack(anchor="w", pady=(0, 12))
-        ttk.Label(sidebar, text="Поиск документов").pack(anchor="w")
-        self.query = tk.StringVar()
-        self.search = ttk.Entry(sidebar, textvariable=self.query, width=29, state="disabled")
-        self.search.pack(fill="x", pady=(3, 8))
-        ttk.Label(sidebar, text="Фильтр по тегу").pack(anchor="w")
-        tag_row = ttk.Frame(sidebar)
-        tag_row.pack(fill="x", pady=(3, 8))
-        self.tag_filter = ttk.Combobox(tag_row, width=16, state="disabled")
-        self.tag_filter.pack(side="left", fill="x", expand=True)
-        self.tag_filter.bind("<<ComboboxSelected>>", lambda _: self.refresh_cards())
-        self.clear_tag_button = ttk.Button(
-            tag_row, text="Сбросить", command=self.clear_tag, state="disabled"
-        )
-        self.clear_tag_button.pack(side="left", padx=(4, 0))
-        self.add_button = ttk.Button(
-            sidebar, text="+  Добавить документ", command=self.save_card, state="disabled",
-            style="Primary.TButton",
-        )
-        self.add_button.pack(fill="x", pady=(0, 8))
-        self.archive_hint = ttk.Label(
-            sidebar, text="Создайте или откройте архив, чтобы добавить документ.",
-            wraplength=255, justify="left", style="Muted.TLabel",
-        )
-        self.archive_hint.pack(anchor="w", pady=(0, 8))
-        table = ttk.Frame(sidebar)
-        table.pack(fill="both", expand=True)
-        self.card_table = ttk.Treeview(
-            table, columns=("number", "title"), show="headings", selectmode="browse", height=8,
-        )
-        self.card_table.heading("number", text="№", anchor="center")
-        self.card_table.heading("title", text="Название", anchor="w")
-        self.card_table.column("number", width=56, stretch=False, anchor="center")
-        self.card_table.column("title", width=198, minwidth=120)
-        scrollbar = ttk.Scrollbar(table, orient="vertical", command=self.card_table.yview)
-        self.card_table.configure(yscrollcommand=scrollbar.set)
-        self.card_table.pack(side="left", fill="both", expand=True)
-        scrollbar.pack(side="right", fill="y")
-        self.table = table
-        self.card_table.bind("<<TreeviewSelect>>", self.select_card)
-        self.query.trace_add("write", lambda *_: self.refresh_cards())
+        splitter = QSplitter(Qt.Orientation.Horizontal)
+        splitter.setContentsMargins(18, 18, 18, 18)
+        splitter.setHandleWidth(12)
+        splitter.setChildrenCollapsible(False)
+        splitter.addWidget(self.build_document_list())
+        splitter.addWidget(self.build_preview())
+        splitter.setStretchFactor(0, 0)
+        splitter.setStretchFactor(1, 1)
+        splitter.setSizes([350, 620])
+        layout.addWidget(splitter, 1)
+        self.find_shortcut = QShortcut(QKeySequence(QKeySequence.StandardKey.Find), self)
+        self.find_shortcut.activated.connect(self.search.setFocus)
+        self.show_catalog(None)
 
-        detail = ttk.Frame(body, padding=16)
-        detail.pack(side="left", fill="both", expand=True)
-        self.card_title = ttk.Label(
-            detail, text="Документ", style="DocumentTitle.TLabel", wraplength=500, justify="left"
-        )
-        self.card_title.pack(anchor="w")
-        self.card_meta = ttk.Label(detail, style="Muted.TLabel", wraplength=500, justify="left")
-        self.card_meta.pack(anchor="w", pady=(2, 8))
-        self.details = ttk.Label(detail, wraplength=500, justify="left")
-        self.details.pack(anchor="w", pady=(0, 8))
-        actions = ttk.Frame(detail)
-        actions.pack(fill="x")
-        self.edit_card_button = ttk.Button(
-            actions, text="Изменить карточку…", command=lambda: self.save_card(edit=True),
-            state="disabled",
-        )
-        self.edit_card_button.pack(side="left", padx=(0, 8))
-        self.edit_tags_button = ttk.Button(
-            actions, text="Изменить теги…", command=self.edit_tags, state="disabled"
-        )
-        self.edit_tags_button.pack(side="left")
-        ttk.Separator(detail).pack(fill="x", pady=(12, 0))
-        controls = ttk.Frame(detail, padding=(0, 8))
-        controls.pack(fill="x")
-        self.previous_page = ttk.Button(
-            controls, text="←", width=3, command=lambda: self.move_page(-1), state="disabled",
-        )
-        self.previous_page.pack(side="left", padx=(0, 3))
-        self.next_page = ttk.Button(
-            controls, text="→", width=3, command=lambda: self.move_page(1), state="disabled",
-        )
-        self.next_page.pack(side="left")
-        self.status = ttk.Label(controls, text="Откройте зашифрованный архив", style="Muted.TLabel")
-        self.status.pack(side="left", padx=10)
-        self.print_button = ttk.Button(
-            controls, text="Печать PDF", command=self.print_pdf,
-            state="disabled",
-        )
-        self.print_button.pack(side="right")
-        self.preview_area = ttk.Frame(detail, style="Workspace.TFrame")
-        self.preview_area.pack(fill="both", expand=True)
-        self.preview_area.bind("<Configure>", self.resize_preview)
-        self.preview = ttk.Label(self.preview_area, anchor="center", style="Preview.TLabel")
-        self.preview.place(relwidth=1, relheight=1)
+    def build_sidebar(self) -> QFrame:
+        sidebar = frame("sidebar")
+        sidebar.setFixedWidth(224)
+        layout = QVBoxLayout(sidebar)
+        layout.setContentsMargins(15, 20, 15, 16)
+        layout.setSpacing(8)
+        brand = QHBoxLayout()
+        mark = label("СА", "brandMark")
+        mark.setFixedSize(34, 34)
+        mark.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        brand.addWidget(mark)
+        brand.addWidget(label("Семейный архив", "brand"), 1)
+        layout.addLayout(brand)
+
+        layout.addSpacing(16)
+        layout.addWidget(label("ОТКРЫТЫЙ АРХИВ", "sideSection"))
+        self.archive_name = label("Архив не открыт", "sideFile", wrap=True)
+        layout.addWidget(self.archive_name)
+        self.archive_hint = label(style="sideCaption", wrap=True)
+        layout.addWidget(self.archive_hint)
+        layout.addWidget(button("Открыть архив…", self.open_archive, sidebar=True))
+        layout.addWidget(button("Новый архив…", lambda: self.create_archive(False), sidebar=True))
+        layout.addSpacing(12)
+        layout.addWidget(label("ТЕГИ", "sideSection"))
+        self.all_documents = button("Все документы", lambda: self.set_tag(""), sidebar=True)
+        self.all_documents.setCheckable(True)
+        layout.addWidget(self.all_documents)
+        self.no_tags = label("Теги появятся после добавления в карточку.", "sideCaption", wrap=True)
+        layout.addWidget(self.no_tags)
+        tags = QWidget()
+        tags.setObjectName("sidebarTags")
+        self.sidebar_tags = TagFlow(tags)
+        layout.addWidget(area(tags), 1)
+
+        self.manage = QToolButton()
+        self.manage.setText("Действия с архивом")
+        self.manage.setProperty("sidebar", True)
+        self.manage.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        self.manage.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        menu = QMenu(self.manage)
+        menu.addAction("Создать копию…", lambda: self.copy_archive(False))
+        menu.addAction("Восстановить из копии…", lambda: self.copy_archive(True))
+        menu.addSeparator()
+        menu.addAction("Создать тестовый архив…", lambda: self.create_archive(True))
+        self.close_action = QAction("Закрыть архив", self)
+        self.close_action.triggered.connect(lambda: self.show_catalog(None))
+        menu.addAction(self.close_action)
+        self.manage.setMenu(menu)
+        layout.addWidget(self.manage)
+        return sidebar
+
+    def build_top_bar(self) -> QFrame:
+        top = frame("topBar")
+        layout = QHBoxLayout(top)
+        layout.setContentsMargins(20, 15, 20, 15)
+        layout.addWidget(label("Документы", "screenTitle"))
+        layout.addStretch(1)
+        self.search = QLineEdit()
+        self.search.setPlaceholderText("Поиск по названию, номеру, тегу")
+        self.search.setAccessibleName("Поиск документов")
+        self.search.setClearButtonEnabled(True)
+        self.search.setMaximumWidth(390)
+        self.search.textChanged.connect(lambda _: self.refresh_list())
+        layout.addWidget(self.search, 1)
+        self.add_button = button("+  Документ", self.save_card, primary=True)
+        layout.addWidget(self.add_button)
+        return top
+
+    def build_document_list(self) -> QFrame:
+        panel = frame("card")
+        panel.setMinimumWidth(289)
+        layout = QVBoxLayout(panel)
+        layout.setContentsMargins(12, 14, 12, 10)
+        header = QHBoxLayout()
+        self.list_title = label("Все документы", "sectionTitle", wrap=True)
+        header.addWidget(self.list_title, 1)
+        self.count = label(style="count")
+        header.addWidget(self.count)
+        layout.addLayout(header)
+        self.rows = QListWidget()
+        self.rows.setAccessibleName("Список документов")
+        self.rows.setSpacing(3)
+        self.rows.currentItemChanged.connect(lambda *_: self.select_card())
+        layout.addWidget(self.rows, 1)
+        self.list_empty = label(style="muted", wrap=True)
+        self.list_empty.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(self.list_empty, 1)
+        return panel
+
+    def build_preview(self) -> QFrame:
+        panel = frame("card")
+        panel.setMinimumWidth(386)
+        layout = QVBoxLayout(panel)
+        layout.setContentsMargins(16, 14, 16, 14)
+        layout.setSpacing(11)
+        toolbar = QHBoxLayout()
+        self.number = label(style="number")
+        toolbar.addWidget(self.number)
+        toolbar.addStretch(1)
+        self.change_card = button("Изменить…", lambda: self.save_card(edit=True))
+        toolbar.addWidget(self.change_card)
+        layout.addLayout(toolbar)
+        self.card_title = label("Откройте архив", "documentTitle", wrap=True)
+        layout.addWidget(self.card_title)
+        self.card_type = label(style="muted", wrap=True)
+        layout.addWidget(self.card_type)
+        chips = QWidget()
+        self.card_tags = TagFlow(chips)
+        layout.addWidget(chips)
+        info = frame("keyInfo")
+        info_layout = QVBoxLayout(info)
+        info_layout.setContentsMargins(10, 8, 10, 8)
+        self.details = label(style="muted", wrap=True)
+        info_layout.addWidget(self.details)
+        self.metadata = area(info)
+        self.metadata.setMaximumHeight(120)
+        self.metadata.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Maximum)
+        layout.addWidget(self.metadata)
+        self.preview = PdfPreview(self.error)
+        layout.addWidget(self.preview, 1)
+        return panel
 
     def password(self, prompt: str) -> str | None:
-        return simpledialog.askstring("Пароль архива", prompt, show="*", parent=self.root)
+        value, accepted = QInputDialog.getText(self, "Пароль архива", prompt, QLineEdit.EchoMode.Password)
+        return value if accepted else None
 
     def save_path(self, title: str) -> Path | None:
-        path = filedialog.asksaveasfilename(
-            title=title, defaultextension=".fvault", filetypes=VAULT_TYPES, parent=self.root
-        )
-        return Path(path) if path else None
+        name, _ = QFileDialog.getSaveFileName(self, title, "", VAULT_FILTER)
+        if not name:
+            return None
+        path = Path(name)
+        return path if path.suffix else path.with_suffix(".fvault")
 
     def source_path(self, title: str) -> Path | None:
-        path = filedialog.askopenfilename(title=title, filetypes=VAULT_TYPES, parent=self.root)
-        return Path(path) if path else None
+        name, _ = QFileDialog.getOpenFileName(self, title, "", VAULT_FILTER)
+        return Path(name) if name else None
 
     def error(self, exc: Exception) -> None:
-        detail = str(exc)
         if isinstance(exc, InvalidTag):
             detail = "Неверный пароль или нарушена целостность архива."
-        if isinstance(exc, FileExistsError):
+        elif isinstance(exc, FileExistsError):
             detail = "Этот файл уже существует. Выберите другое имя."
-        messagebox.showerror("Операция не выполнена", detail, parent=self.root)
+        else:
+            detail = str(exc)
+        QMessageBox.warning(self, "Операция не выполнена", detail)
 
-    def create_archive(self, sample: bool) -> None:
-        path = self.save_path("Создать тестовый архив" if sample else "Новый архив")
+    def create_archive(self, demo: bool) -> None:
+        path = self.save_path("Создать тестовый архив" if demo else "Новый архив")
         if path is None:
             return
         password = self.password("Новый пароль, от 12 символов")
@@ -219,7 +569,12 @@ class ArchiveWindow:
             self.error(ValueError("Пароли не совпадают."))
             return
         try:
-            cards = (Card("Тестовый документ", pdf=sample_pdf()),) if sample else ()
+            cards = (
+                Card("Страховой полис на квартиру", kind="Страховой полис", tags="Дом, 2024",
+                     cabinet="Шкаф в кабинете", folder="03 · Недвижимость", pdf=sample_pdf()),
+                Card("Паспорт", kind="Паспорт", party="Анна", tags="Анна, Семья", folder="02 · Личные документы"),
+                Card("Договор обслуживания", kind="Договор", tags="Дом, 2025", folder="03 · Недвижимость"),
+            ) if demo else ()
             catalog = Catalog.create(path, password, cards=cards)
         except (OSError, ValueError) as exc:
             self.error(exc)
@@ -231,10 +586,8 @@ class ArchiveWindow:
         if path is None:
             return
         password = self.password("Введите пароль")
-        if password is not None:
-            self.show_archive(path, password)
-
-    def show_archive(self, path: Path, password: str) -> None:
+        if password is None:
+            return
         try:
             catalog = Catalog.open(path, password)
         except (OSError, ValueError, InvalidTag) as exc:
@@ -242,206 +595,173 @@ class ArchiveWindow:
             return
         self.show_catalog(catalog)
 
-    def show_catalog(self, catalog: Catalog) -> None:
+    def show_catalog(self, catalog: Catalog | None) -> None:
         self.catalog = catalog
-        self.can_edit = catalog.editable
-        self.archive_name.configure(text=catalog.path.name)
-        self.close_archive_button.configure(state="normal")
-        self.search.configure(state="normal")
-        self.add_button.configure(state="normal" if self.can_edit else "disabled")
-        if self.can_edit:
-            self.archive_hint.pack_forget()
-        else:
-            self.archive_hint.configure(
-                text="Архив открыт для просмотра. Чтобы редактировать, сохраните личную "
-                "копию через «Восстановить из копии»."
-            )
-            self.archive_hint.pack(anchor="w", pady=(0, 8), before=self.table)
-        self.tag_filter.set("")
-        self.refresh_tags()
-        self.query.set("")
+        self.active_tag = ""
+        self.archive_name.setText(catalog.path.name if catalog is not None else "Архив не открыт")
+        self.archive_hint.setText(
+            "Только просмотр. Для правок восстановите личную копию."
+            if catalog is not None and not catalog.editable else ""
+        )
+        self.archive_hint.setVisible(bool(self.archive_hint.text()))
+        self.close_action.setEnabled(catalog is not None)
+        self.search.setEnabled(catalog is not None)
+        self.add_button.setEnabled(catalog is not None and catalog.editable)
+        self.search.blockSignals(True)
+        self.search.clear()
+        self.search.blockSignals(False)
+        self.refresh_sidebar_tags()
+        self.refresh_list(0)
 
-    def close_archive(self) -> None:
-        self.catalog = None
-        self.can_edit = False
-        self.archive_name.configure(text="Архив не открыт")
-        self.close_archive_button.configure(state="disabled")
-        self.search.configure(state="disabled")
-        self.add_button.configure(state="disabled")
-        self.archive_hint.configure(text="Создайте или откройте архив, чтобы добавить документ.")
-        self.archive_hint.pack(anchor="w", pady=(0, 8), before=self.table)
-        self.refresh_tags()
-        self.query.set("")
-
-    def refresh_tags(self) -> None:
-        active = self.tag_filter.get().casefold()
+    def refresh_sidebar_tags(self) -> None:
         tags = self.catalog.available_tags if self.catalog is not None else ()
-        self.tag_filter.configure(values=tags, state="readonly" if tags else "disabled")
-        self.tag_filter.set(next((tag for tag in tags if tag.casefold() == active), ""))
+        self.active_tag = next((tag for tag in tags if tag.casefold() == self.active_tag.casefold()), "")
+        self.all_documents.setChecked(not self.active_tag)
+        self.no_tags.setVisible(self.catalog is not None and not tags)
+        clear_tags(self.sidebar_tags)
+        for name in tags:
+            chip = tag_button(name)
+            chip.clicked.connect(lambda _, name=name: self.set_tag(name))
+            if name == self.active_tag:
+                chip.setText(f"✓  {chip.text()}")
+            self.sidebar_tags.addWidget(chip)
+        self.sidebar_tags.parentWidget().updateGeometry()
 
-    def clear_tag(self) -> None:
-        self.tag_filter.set("")
-        self.refresh_cards()
+    def set_tag(self, name: str) -> None:
+        if name.casefold() == self.active_tag.casefold():
+            name = ""
+        self.active_tag = name
+        self.refresh_sidebar_tags()
+        self.refresh_list()
 
-    def refresh_cards(self, preferred_index: int | None = None) -> None:
+    def refresh_list(self, preferred: int | None = None) -> None:
+        if preferred is None:
+            preferred = self.selected_index()
+        self.rows.blockSignals(True)
+        self.rows.clear()
         cards = self.catalog.cards if self.catalog is not None else ()
-        query, tag = self.query.get(), self.tag_filter.get()
-        self.clear_tag_button.configure(state="normal" if tag else "disabled")
-        self.card_table.delete(*self.card_table.get_children())
         for index, card in enumerate(cards):
-            if card.matches(query, tag=tag):
-                self.card_table.insert("", "end", iid=str(index), values=(card.archive_label, card.title))
-        rows = self.card_table.get_children()
-        if rows:
-            preferred = str(preferred_index)
-            row = preferred if preferred in rows else rows[0]
-            self.card_table.selection_set(row)
-            self.card_table.focus(row)
-            self.card_table.see(row)
+            if not card.matches(self.search.text(), tag=self.active_tag):
+                continue
+            item = QListWidgetItem()
+            item.setData(Qt.ItemDataRole.UserRole, index)
+            item.setData(Qt.ItemDataRole.AccessibleTextRole, card.title)
+            item.setData(Qt.ItemDataRole.AccessibleDescriptionRole, f"№ {card.archive_label} · {card.kind}")
+            item.setToolTip(card.title)
+            item.setSizeHint(QSize(0, 72 if card.tags else 54))
+            self.rows.addItem(item)
+            row = DocumentRow(card, lambda item=item: self.rows.setCurrentItem(item), self.set_tag)
+            self.rows.setItemWidget(item, row)
+            if index == preferred:
+                self.rows.setCurrentItem(item)
+        if self.rows.count() and self.rows.currentItem() is None:
+            self.rows.setCurrentRow(0)
+        current = self.rows.currentItem()
+        if current is not None:
+            self.rows.scrollToItem(current)
+        self.rows.blockSignals(False)
+        self.list_title.setText(self.active_tag or "Все документы")
+        self.count.setText(str(self.rows.count()) if self.catalog is not None else "")
+        self.count.setVisible(self.catalog is not None)
+        self.rows.setVisible(bool(self.rows.count()))
+        if self.catalog is None:
+            empty = "Откройте или создайте архив"
+        elif not cards:
+            empty = "Добавьте первый документ"
+        else:
+            empty = "Документы не найдены"
+        self.list_empty.setText(empty)
+        self.list_empty.setVisible(not self.rows.count())
         self.select_card()
 
     def selected_index(self) -> int | None:
-        selected = self.card_table.selection()
-        return int(selected[0]) if selected else None
+        item = self.rows.currentItem()
+        return item.data(Qt.ItemDataRole.UserRole) if item is not None else None
 
-    def select_card(self, _event=None) -> None:
+    def select_card(self) -> None:
         index = self.selected_index()
         card = self.catalog.cards[index] if self.catalog is not None and index is not None else None
         if card is not None and card is self.displayed_card:
             return
         self.displayed_card = card
-        if self.document is not None:
-            self.document.close()
-        self.document = self.pdf = self.image = None
-        self.preview.configure(image="")
-        self.print_button.configure(state="disabled")
-        self.previous_page.configure(state="disabled")
-        self.next_page.configure(state="disabled")
-        self.edit_tags_button.configure(state="disabled")
-        self.edit_card_button.configure(state="disabled")
-        self.card_title.configure(text="Документ")
-        self.card_meta.configure(text="")
-        self.details.configure(text="")
-        self.status.configure(text="Документы не найдены" if self.catalog else "Откройте архив")
+        editable = card is not None and self.catalog.editable
+        self.change_card.setVisible(editable)
+        self.number.setVisible(card is not None)
+        self.card_type.setVisible(card is not None and bool(card.kind))
+        clear_tags(self.card_tags)
         if card is None:
+            self.card_title.setText("Откройте архив" if self.catalog is None else "Документ")
+            self.details.clear()
+            self.metadata.hide()
+            self.preview.set_pdf(None, "Выберите документ с PDF")
             return
-        if self.can_edit:
-            self.edit_tags_button.configure(state="normal")
-            self.edit_card_button.configure(state="normal")
-        self.card_title.configure(text=card.title)
-        self.card_meta.configure(text="  ·  ".join(filter(None, (f"№ {card.archive_label}", card.kind))))
+        self.number.setText(f"№ {card.archive_label}")
+        self.card_title.setText(card.title)
+        self.card_type.setText(card.kind)
+        for name in tag_names(card.tags):
+            chip = tag_button(name)
+            chip.clicked.connect(lambda _, name=name: self.set_tag(name))
+            self.card_tags.addWidget(chip)
+        if editable:
+            add_tags = button("Изменить теги…", self.edit_tags)
+            add_tags.setObjectName("smallButton")
+            self.card_tags.addWidget(add_tags)
+        self.card_tags.parentWidget().updateGeometry()
         lines = [
-            f"{label}: {getattr(card, key)}"
-            for key, label in CARD_FIELDS[2:8] if getattr(card, key)
+            f"{title}: {getattr(card, key)}"
+            for key, title in CARD_FIELDS[2:8] if key != "tags" and getattr(card, key)
         ]
         if card.address:
             lines.append(f"Оригинал: {card.address}")
-        self.details.configure(text="\n".join(lines))
-        self.status.configure(text="У документа нет PDF")
-        if card.pdf is None:
-            return
-        document = None
-        try:
-            document = pdfium.PdfDocument(card.pdf)
-            image = self.render(document, 0)
-        except (OSError, ValueError, IndexError, pdfium.PdfiumError, tk.TclError) as exc:
-            if document is not None:
-                document.close()
-            self.status.configure(text="Не удалось открыть PDF")
-            self.error(exc)
-            return
-        self.document, self.pdf = document, card.pdf
-        self.set_page(image, 0)
-        self.print_button.configure(state="normal")
+        self.details.setText("\n".join(lines))
+        self.metadata.setVisible(bool(lines))
+        self.preview.set_pdf(card.pdf)
 
     def save_card(self, *, edit: bool = False) -> None:
-        if self.catalog is None or not self.can_edit:
+        if self.catalog is None or not self.catalog.editable:
             return
         index = self.selected_index() if edit else None
         if edit and index is None:
             return
         card = self.catalog.cards[index] if index is not None else None
-        dialog = CardDialog(self.root, self.catalog.available_kinds, card)
-        if dialog.result is None:
+        dialog = CardDialog(self, self.catalog.available_kinds, card)
+        if dialog.exec() != QDialog.DialogCode.Accepted or dialog.card is None:
             return
         try:
             if index is None:
-                self.catalog = self.catalog.add(dialog.result)
+                self.catalog = self.catalog.add(dialog.card)
                 index = len(self.catalog.cards) - 1
             else:
-                self.catalog = self.catalog.update(index, dialog.result)
+                self.catalog = self.catalog.update(index, dialog.card)
         except (OSError, ValueError) as exc:
             self.error(exc)
             return
-        self.refresh_tags()
-        if not self.catalog.cards[index].matches(self.query.get(), tag=self.tag_filter.get()):
-            self.tag_filter.set("")
-            self.query.set("")
-        self.refresh_cards(index)
+        if not self.catalog.cards[index].matches(self.search.text(), tag=self.active_tag):
+            self.active_tag = ""
+            self.search.blockSignals(True)
+            self.search.clear()
+            self.search.blockSignals(False)
+        self.refresh_sidebar_tags()
+        self.refresh_list(index)
 
     def edit_tags(self) -> None:
         index = self.selected_index()
-        if index is None or self.catalog is None or not self.can_edit:
+        if index is None or self.catalog is None or not self.catalog.editable:
             return
-        current = self.catalog.cards[index].tags
-        value = simpledialog.askstring(
-            "Теги документа",
-            "Введите теги через запятую, например Анна, 2024.\n"
-            "Оставьте поле пустым, чтобы удалить все теги.",
-            initialvalue=current, parent=self.root,
-        )
-        if value is None or ", ".join(tag_names(value)) == current:
+        existing = self.catalog.cards[index].tags
+        dialog = TagDialog(self, existing)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        value = dialog.editor.value()
+        if value == existing:
             return
         try:
             self.catalog = self.catalog.set_tags(index, value)
         except (OSError, ValueError) as exc:
             self.error(exc)
             return
-        self.refresh_tags()
-        self.refresh_cards(index)
-
-    def resize_preview(self, _event) -> None:
-        if self.preview_resize is not None:
-            self.root.after_cancel(self.preview_resize)
-        self.preview_resize = self.root.after(100, self.redraw_preview)
-
-    def redraw_preview(self) -> None:
-        self.preview_resize = None
-        if self.document is not None:
-            self.move_page(0)
-
-    def render(self, document, index: int):
-        page = document[index]
-        try:
-            width, height = page.get_size()
-            if width <= 0 or height <= 0:
-                raise ValueError("У страницы PDF некорректный размер.")
-            available_width = max(100, self.preview_area.winfo_width() - 16)
-            available_height = max(100, self.preview_area.winfo_height() - 16)
-            scale = min(available_width / width, available_height / height, 1200 / max(width, height))
-            bitmap = page.render(scale=scale)
-            try:
-                return ImageTk.PhotoImage(bitmap.to_pil())
-            finally:
-                bitmap.close()
-        finally:
-            page.close()
-
-    def set_page(self, image, index: int) -> None:
-        self.image, self.page = image, index
-        self.preview.configure(image=image)
-        count = len(self.document)
-        self.status.configure(text=f"Страница {index + 1} из {count}")
-        self.previous_page.configure(state="normal" if index > 0 else "disabled")
-        self.next_page.configure(state="normal" if index + 1 < count else "disabled")
-
-    def move_page(self, delta: int) -> None:
-        index = self.page + delta
-        if self.document is not None and 0 <= index < len(self.document):
-            try:
-                self.set_page(self.render(self.document, index), index)
-            except (ValueError, pdfium.PdfiumError, tk.TclError) as exc:
-                self.error(exc)
+        self.refresh_sidebar_tags()
+        self.refresh_list(index)
 
     def copy_archive(self, restore: bool) -> None:
         if self.catalog is not None and not restore:
@@ -453,7 +773,7 @@ class ArchiveWindow:
             except (OSError, ValueError) as exc:
                 self.error(exc)
                 return
-            messagebox.showinfo("Копия создана", str(destination), parent=self.root)
+            QMessageBox.information(self, "Копия создана", str(destination))
             return
         source = self.source_path("Выберите резервную копию" if restore else "Выберите архив")
         if source is None:
@@ -466,129 +786,22 @@ class ArchiveWindow:
             return
         try:
             copy_verified(source, destination, password)
+            if restore:
+                self.show_catalog(Catalog.open(destination, password))
         except (OSError, ValueError, InvalidTag) as exc:
             self.error(exc)
             return
-        if restore:
-            self.show_archive(destination, password)
-        else:
-            messagebox.showinfo("Копия создана", str(destination), parent=self.root)
-
-    def print_pdf(self) -> None:
-        if self.pdf is None or not messagebox.askokcancel(
-            "Печать", "Отправить PDF на принтер по умолчанию?", parent=self.root
-        ):
-            return
-        try:
-            result = subprocess.run(
-                ["/usr/bin/lp", "-t", "Family archive PDF", "-"],
-                input=self.pdf, capture_output=True, timeout=30, check=False,
-            )
-            if result.returncode:
-                raise RuntimeError(result.stderr.decode(errors="replace").strip() or "Ошибка CUPS.")
-        except (OSError, RuntimeError, subprocess.TimeoutExpired) as exc:
-            self.error(exc)
-            return
-        messagebox.showinfo("Печать", "Задание передано в очередь печати.", parent=self.root)
-
-
-class CardDialog(simpledialog.Dialog):
-    def __init__(self, parent, kinds: tuple[str, ...], card: Card | None):
-        self.kinds = kinds
-        self.card = card
-        super().__init__(parent, "Изменить карточку" if card is not None else "Новый документ")
-
-    def body(self, master):
-        self.configure(background="#FFFFFF")
-        master.configure(background="#FFFFFF")
-        self.pdf = self.card.pdf if self.card is not None else None
-        self.inputs = {}
-        ttk.Label(
-            master, text="Укажите название. Приложите PDF или заполните поле «Шкаф или "
-            "место хранения» либо «Папка».", wraplength=560, justify="left",
-            style="Muted.TLabel",
-        ).pack(anchor="w", padx=14, pady=(12, 2))
-        panels = ttk.Frame(master, padding=12)
-        panels.pack(fill="both", expand=True)
-        document_panel = ttk.Frame(panels)
-        document_panel.pack(side="left", fill="y", padx=(0, 18))
-        original_panel = ttk.Frame(panels)
-        original_panel.pack(side="left", fill="y")
-        ttk.Label(document_panel, text="Документ", style="Section.TLabel").pack(anchor="w", pady=(0, 6))
-        ttk.Label(original_panel, text="Бумажный оригинал", style="Section.TLabel").pack(anchor="w", pady=(0, 6))
-        for key, label in CARD_FIELDS[:8]:
-            self.add_field(document_panel, key, label, 30)
-        for key, label in CARD_FIELDS[8:]:
-            self.add_field(original_panel, key, label, 24)
-        ttk.Separator(original_panel).pack(fill="x", pady=10)
-        ttk.Label(original_panel, text="Вложение", style="Section.TLabel").pack(anchor="w", pady=(0, 6))
-        ttk.Button(original_panel, text="Выбрать PDF…", command=self.choose_pdf).pack(anchor="w")
-        self.filename = ttk.Label(
-            original_panel, text="PDF прикреплён" if self.pdf is not None else "PDF не выбран",
-            wraplength=210, style="Muted.TLabel",
-        )
-        self.filename.pack(anchor="w", pady=6)
-        return self.inputs["title"]
-
-    def add_field(self, panel, key: str, label: str, width: int) -> None:
-        labels = {
-            "title": "Название (обязательно)", "kind": "Тип (выберите или впишите свой)",
-            "number": "Номер на оригинале (необязательно)", "tags": "Теги через запятую",
-        }
-        ttk.Label(panel, text=labels.get(key, label)).pack(anchor="w")
-        if key == "kind":
-            entry = ttk.Combobox(panel, width=width, values=self.kinds)
-        else:
-            entry = ttk.Entry(panel, width=width)
-        if self.card is not None:
-            entry.insert(0, getattr(self.card, key))
-        entry.pack(fill="x", pady=(2, 5))
-        self.inputs[key] = entry
-
-    def buttonbox(self):
-        buttons = ttk.Frame(self, padding=(12, 0, 12, 12))
-        ttk.Button(buttons, text="Сохранить", command=self.ok, style="Primary.TButton").pack(side="right", padx=4)
-        ttk.Button(buttons, text="Отмена", command=self.cancel).pack(side="right", padx=4)
-        self.bind("<Return>", self.ok)
-        self.bind("<Escape>", self.cancel)
-        buttons.pack(fill="x")
-
-    def choose_pdf(self) -> None:
-        filename = filedialog.askopenfilename(
-            title="Выберите PDF", filetypes=[("PDF", "*.pdf")], parent=self
-        )
-        if not filename:
-            return
-        try:
-            path = Path(filename)
-            pdf = read_pdf(path)
-            with pdfium.PdfDocument(pdf) as doc:
-                if len(doc) == 0:
-                    raise ValueError("В PDF нет страниц.")
-        except (OSError, ValueError, pdfium.PdfiumError) as exc:
-            messagebox.showerror("Не удалось приложить PDF", str(exc), parent=self)
-            return
-        self.pdf = pdf
-        self.filename.configure(text=path.name)
-
-    def validate(self):
-        card = Card(**{key: entry.get().strip() for key, entry in self.inputs.items()}, pdf=self.pdf)
-        try:
-            card.validate()
-        except ValueError as exc:
-            messagebox.showerror("Проверьте карточку", str(exc), parent=self)
-            return False
-        self.result = card
-        return True
+        if not restore:
+            QMessageBox.information(self, "Копия создана", str(destination))
 
 
 def main() -> None:
-    root = tk.Tk()
-    configure_appearance(root)
-    root.minsize(900, 620)
-    root.geometry("1060x740")
-    ArchiveWindow(root)
-    root.mainloop()
+    app = QApplication(sys.argv)
+    app.setApplicationName("Семейный архив")
+    apply_style(app)
+    window = ArchiveWindow()
+    window.show()
+    app.exec()
 
 
 if __name__ == "__main__":

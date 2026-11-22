@@ -26,13 +26,13 @@ fi
 export PATH="/Library/Frameworks/Python.framework/Versions/3.14/bin:/Library/Frameworks/Python.framework/Versions/3.12/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
 python_command=""
 for candidate in python3.14 python3.12; do
-    if command -v "$candidate" >/dev/null && "$candidate" -c 'import tkinter' 2>/dev/null; then
+    if command -v "$candidate" >/dev/null; then
         python_command="$candidate"
         break
     fi
 done
 if [[ -z "$python_command" ]]; then
-    echo "Установите Python 3.14 или 3.12 с поддержкой Tk, затем снова откройте этот файл."
+    echo "Установите Python 3.14 или 3.12, затем снова откройте этот файл."
     open 'https://www.python.org/downloads/macos/'
     wait_for_enter
     exit 1
