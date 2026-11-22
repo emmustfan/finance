@@ -78,6 +78,14 @@ QListWidget { background: transparent; border: 0; outline: 0; padding: 1px; }
 QListWidget::item { border: 1px solid transparent; border-radius: 11px; }
 QListWidget::item:hover { background: #F1F5FA; }
 QListWidget::item:selected { color: #1A2737; background: #E7F4EF; border: 1px solid #C6E4D9; }
+QTableWidget#ledgerTable {
+    background: white; alternate-background-color: #F4F7FA; border: 1px solid #DCE3EC;
+    border-radius: 8px; selection-background-color: #E7F4EF; selection-color: #1A2737;
+}
+QTableWidget#ledgerTable::item { padding: 0 6px; }
+QTableWidget#ledgerTable QHeaderView::section {
+    background: #EAF0F6; color: #35485E; padding: 7px 6px; border: 0;
+}
 QDialog { background: white; }
 QMenu { color: #1A2737; background: white; border: 1px solid #DBE3EC; padding: 4px; }
 QMenu::item { padding: 8px 16px; }

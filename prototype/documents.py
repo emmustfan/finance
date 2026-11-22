@@ -15,6 +15,7 @@ from pathlib import Path
 from PIL import Image, ImageOps
 
 from assets import Asset, validate_assets
+from ledger import Ledger
 from vault import (
     DOCUMENT_MAGIC, MAGIC, MAX_DOCUMENT_DATA, MAX_PDF, UnlockedVault, _check_pdf,
     _write_new, read_container,
@@ -140,7 +141,7 @@ def read_pdf(path: Path) -> bytes:
     return pdf
 
 
-def _encode_catalog(cards: tuple[Card, ...], assets: tuple[Asset, ...]) -> bytes:
+def _encode_catalog(cards: tuple[Card, ...], assets: tuple[Asset, ...], ledger: Ledger) -> bytes:
     attachment_bytes = sum(
         len(card.pdf or b"") + sum(len(photo.data) for photo in card.photos) for card in cards
     )
@@ -161,19 +162,27 @@ def _encode_catalog(cards: tuple[Card, ...], assets: tuple[Asset, ...]) -> bytes
             item.pop("photos")
         items.append(item)
     validate_assets(assets, {card.archive_number for card in cards})
-    content = {"cards": items, "assets": [asdict(asset) for asset in assets]} if assets else items
+    ledger.validate(assets)
+    content = items
+    if assets:
+        content = {"cards": items, "assets": [asdict(asset) for asset in assets]}
+        if ledger.openings:
+            content["ledger"] = ledger.to_payload()
     payload = json.dumps(content, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
     if len(payload) > MAX_DOCUMENT_DATA:
         raise ValueError("Архив превысил лимит 64 МиБ. Создайте отдельный архив.")
     return payload
 
 
-def decode_catalog(payload: bytes) -> tuple[tuple[Card, ...], tuple[Asset, ...]]:
+def decode_catalog(payload: bytes) -> tuple[tuple[Card, ...], tuple[Asset, ...], Ledger]:
     try:
         content = json.loads(payload)
         assets = []
-        if isinstance(content, dict) and set(content) == {"cards", "assets"}:
+        ledger = Ledger()
+        if isinstance(content, dict) and set(content) - {"ledger"} == {"cards", "assets"}:
             items = content["cards"]
+            if "ledger" in content:
+                ledger = Ledger.from_payload(content["ledger"])
             if not isinstance(content["assets"], list):
                 raise ValueError("Ожидается список активов.")
             for item in content["assets"]:
@@ -210,7 +219,8 @@ def decode_catalog(payload: bytes) -> tuple[tuple[Card, ...], tuple[Asset, ...]]
             card.validate()
             cards.append(card)
         validate_assets(tuple(assets), numbers)
-        return tuple(cards), tuple(assets)
+        ledger.validate(tuple(assets))
+        return tuple(cards), tuple(assets), ledger
     except (ValueError, TypeError, KeyError, UnicodeError) as exc:
         raise ValueError("Не удалось прочитать карточки архива.") from exc
 
@@ -229,6 +239,7 @@ class Catalog:
     revision: bytes
     _unlocked: UnlockedVault = field(repr=False, compare=False)
     assets: tuple[Asset, ...] = ()
+    ledger: Ledger = Ledger()
 
     @classmethod
     def open(cls, path: Path, password: str) -> "Catalog":
@@ -236,22 +247,23 @@ class Catalog:
         data = read_container(path)
         unlocked, magic, payload = UnlockedVault.open(data, password)
         if magic == MAGIC:
-            cards, assets = (Card("Тестовый документ", pdf=payload, archive_number=1),), ()
+            cards, assets, ledger = (Card("Тестовый документ", pdf=payload, archive_number=1),), (), Ledger()
         else:
-            cards, assets = decode_catalog(payload)
-        return cls(path, cards, hashlib.sha256(data).digest(), unlocked, assets)
+            cards, assets, ledger = decode_catalog(payload)
+        return cls(path, cards, hashlib.sha256(data).digest(), unlocked, assets, ledger)
 
     @classmethod
     def create(
-        cls, path: Path, password: str, *, cards: tuple[Card, ...] = (), assets: tuple[Asset, ...] = ()
+        cls, path: Path, password: str, *, cards: tuple[Card, ...] = (),
+        assets: tuple[Asset, ...] = (), ledger: Ledger = Ledger(),
     ) -> "Catalog":
         path = path.parent.resolve() / path.name
         cards = tuple(replace(card, archive_number=index) for index, card in enumerate(cards, start=1))
         unlocked = UnlockedVault.create(password)
         assets = tuple(replace(asset, asset_number=index) for index, asset in enumerate(assets, start=1))
-        data = unlocked.encrypt(_encode_catalog(cards, assets), DOCUMENT_MAGIC)
+        data = unlocked.encrypt(_encode_catalog(cards, assets, ledger), DOCUMENT_MAGIC)
         _write_new(path, data)
-        return cls(path, cards, hashlib.sha256(data).digest(), unlocked, assets)
+        return cls(path, cards, hashlib.sha256(data).digest(), unlocked, assets, ledger)
 
     def add(self, card: Card) -> "Catalog":
         number = max((existing.archive_number for existing in self.cards), default=0) + 1
@@ -315,6 +327,13 @@ class Catalog:
         assets = (*self.assets[:index], asset, *self.assets[index + 1:])
         return self._save(self.cards, assets)
 
+    def recorded_value(self, asset: Asset) -> Asset:
+        latest = self.ledger.latest_balance(asset.asset_number)
+        return replace(asset, amount=latest[0], as_of=latest[1]) if latest is not None else asset
+
+    def save_ledger(self, ledger: Ledger) -> "Catalog":
+        return self._save(self.cards, self.assets, ledger)
+
     def _read_current(self) -> bytes:
         data = read_container(self.path)
         if hashlib.sha256(data).digest() != self.revision:
@@ -342,9 +361,12 @@ class Catalog:
         if not self.editable:
             raise ValueError("Для изменения нужен архив владельца с приватными правами доступа.")
 
-    def _save(self, cards: tuple[Card, ...], assets: tuple[Asset, ...]) -> "Catalog":
+    def _save(
+        self, cards: tuple[Card, ...], assets: tuple[Asset, ...], ledger: Ledger | None = None
+    ) -> "Catalog":
         self._check_editable()
-        payload = _encode_catalog(cards, assets)
+        ledger = self.ledger if ledger is None else ledger
+        payload = _encode_catalog(cards, assets, ledger)
         lock_path = self.path.with_name(f".{self.path.name}.lock")
         fd = os.open(lock_path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
         with os.fdopen(fd, "rb+") as lock:
@@ -362,4 +384,4 @@ class Catalog:
                     os.replace(temporary, self.path)
                 finally:
                     temporary.unlink(missing_ok=True)
-        return replace(self, cards=cards, assets=assets, revision=hashlib.sha256(data).digest())
+        return replace(self, cards=cards, assets=assets, ledger=ledger, revision=hashlib.sha256(data).digest())

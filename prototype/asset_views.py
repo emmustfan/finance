@@ -20,6 +20,9 @@ class AssetEditor(QDialog):
         self.setWindowTitle("Изменить карточку" if asset else "Новый счёт или актив")
         self.resize(780, 595)
         self.result_asset: Asset | None = None
+        self.original = asset
+        self.ledger_managed = asset is not None and catalog.ledger.opening(asset.asset_number) is not None
+        displayed = catalog.recorded_value(asset) if asset is not None else None
         self.documents = {card.archive_number for card in catalog.cards}
 
         layout = QVBoxLayout(self)
@@ -54,7 +57,9 @@ class AssetEditor(QDialog):
         if asset:
             self.status.setCurrentIndex(self.status.findData(asset.status))
 
-        self.amount = QLineEdit(amount_text(asset.amount) if asset and asset.amount is not None else "")
+        self.amount = QLineEdit(
+            amount_text(displayed.amount) if displayed and displayed.amount is not None else ""
+        )
         self.amount.setPlaceholderText("125 500,50")
         self.currency = QLineEdit(asset.currency if asset else "RUB")
         self.currency.setMaxLength(3)
@@ -62,8 +67,12 @@ class AssetEditor(QDialog):
         money = QHBoxLayout()
         money.addWidget(self.amount, 1)
         money.addWidget(self.currency)
-        self.as_of = QLineEdit(asset.as_of if asset else "")
+        self.as_of = QLineEdit(displayed.as_of if displayed else "")
         self.as_of.setPlaceholderText("ГГГГ-ММ-ДД")
+        if self.ledger_managed:
+            self.category.setEnabled(False)
+            for field in (self.amount, self.currency, self.as_of):
+                field.setReadOnly(True)
         self.pointer = QLineEdit(asset.access_pointer if asset else "")
         self.pointer.setPlaceholderText("База → группа → запись")
         form.addRow("Название", self.title)
@@ -74,6 +83,8 @@ class AssetEditor(QDialog):
         form.addRow("Статус", self.status)
         form.addRow("Остаток / оценка", money)
         form.addRow("На дату", self.as_of)
+        if self.ledger_managed:
+            form.addRow("", label("Остаток рассчитывается по журналу операций.", "small", wrap=True))
         form.addRow("Путь в KeePassXC", self.pointer)
         form.addRow("", label("Укажите, где искать запись в KeePassXC.", "small", wrap=True))
 
@@ -129,8 +140,10 @@ class AssetEditor(QDialog):
             asset = Asset(
                 title=self.title.text().strip(), category=self.category.currentData(), owner=self.owner.text().strip(),
                 kind=self.kind.text().strip(), organization=self.organization.text().strip(),
-                status=self.status.currentData(), amount=parse_amount(self.amount.text()),
-                currency=self.currency.text().strip().upper(), as_of=self.as_of.text().strip(),
+                status=self.status.currentData(),
+                amount=self.original.amount if self.ledger_managed else parse_amount(self.amount.text()),
+                currency=self.currency.text().strip().upper(),
+                as_of=self.original.as_of if self.ledger_managed else self.as_of.text().strip(),
                 access_pointer=self.pointer.text().strip(), document_numbers=numbers,
             )
             asset.validate(self.documents)
@@ -227,7 +240,8 @@ class RegistryDialog(QDialog):
     def refresh(self, preferred: int | None = None) -> None:
         if preferred is None:
             preferred = self.selected_index()
-        for key, totals in totals_by_category(self.catalog.assets).items():
+        assets = tuple(self.catalog.recorded_value(asset) for asset in self.catalog.assets)
+        for key, totals in totals_by_category(assets).items():
             values = [f"{amount_text(value)} {currency}" for currency, value in sorted(totals.items())]
             self.totals[key].setText("\n".join(values) if values else "—")
         self.rows.blockSignals(True)
@@ -255,7 +269,7 @@ class RegistryDialog(QDialog):
             self.values.clear()
             self.pointer.clear()
         else:
-            asset = self.catalog.assets[index]
+            asset = self.catalog.recorded_value(self.catalog.assets[index])
             self.title.setText(asset.title)
             details = [
                 " · ".join(filter(None, (CATEGORIES[asset.category], asset.kind, STATUSES[asset.status]))),

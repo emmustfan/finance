@@ -25,6 +25,8 @@ from appearance import ChoiceBox, TagEditor, TagFlow, apply_style, area, button,
 from asset_views import RegistryDialog
 from assets import Asset
 from documents import CARD_FIELDS, MAX_ATTACHMENT_BYTES, Card, Catalog, Photo, read_pdf, read_photo, tag_names
+from ledger import Ledger, Opening
+from ledger_views import LedgerDialog
 from sample import sample_pdf
 from vault import copy_verified
 
@@ -615,6 +617,8 @@ class ArchiveWindow(QMainWindow):
         layout.addWidget(self.folders_button)
         self.assets_button = button("Счета и активы…", self.open_registry, sidebar=True)
         layout.addWidget(self.assets_button)
+        self.operations_button = button("Выписки и операции…", self.open_operations, sidebar=True)
+        layout.addWidget(self.operations_button)
         layout.addSpacing(12)
         layout.addWidget(label("ТЕГИ", "sideSection"))
         self.all_documents = button("Все документы", lambda: self.set_tag(""), sidebar=True)
@@ -764,10 +768,18 @@ class ArchiveWindow(QMainWindow):
                       amount=850_000_000, as_of="2026-11-01",
                       access_pointer="Семейные доступы → Страхование → Полис квартиры",
                       document_numbers=(1, 3)),
-                Asset("Семейные накопления", "account", "Анна", kind="Накопительный счёт",
-                      organization="Пример банка", amount=8_000_000, as_of="2026-11-01"),
+                Asset("Основной счёт", "account", "Анна", organization="Т-Банк"),
+                Asset("Накопительный счёт", "account", "Анна", organization="Т-Банк"),
+                Asset("Покупки", "account", "Анна", organization="Ozon Банк"),
+                Asset("Расчётный счёт ИП", "account", "Анна", kind="Счёт ИП", organization="Модульбанк"),
             ) if demo else ()
-            catalog = Catalog.create(path, password, cards=cards, assets=assets)
+            ledger = Ledger(openings=(
+                Opening(2, "2026-10-31", 1_000_000, "RUB", "DEMO-T-MAIN"),
+                Opening(3, "2026-10-31", 2_000_000, "RUB", "DEMO-T-SAVINGS"),
+                Opening(4, "2026-10-31", 250_000, "RUB", "DEMO-OZON"),
+                Opening(5, "2026-10-31", 500_000, "RUB", "DEMO-IP"),
+            )) if demo else Ledger()
+            catalog = Catalog.create(path, password, cards=cards, assets=assets, ledger=ledger)
         except (OSError, ValueError) as exc:
             self.error(exc)
             return
@@ -800,6 +812,7 @@ class ArchiveWindow(QMainWindow):
         self.search.setEnabled(catalog is not None)
         self.folders_button.setEnabled(catalog is not None)
         self.assets_button.setEnabled(catalog is not None)
+        self.operations_button.setEnabled(catalog is not None)
         self.add_button.setEnabled(catalog is not None and catalog.editable)
         self.search.blockSignals(True)
         self.search.clear()
@@ -822,6 +835,12 @@ class ArchiveWindow(QMainWindow):
         self.catalog = dialog.catalog
         if result == QDialog.DialogCode.Accepted and dialog.document_number is not None:
             self.show_document(dialog.document_number)
+
+    def open_operations(self) -> None:
+        if self.catalog is not None:
+            dialog = LedgerDialog(self, self.catalog)
+            dialog.exec()
+            self.catalog = dialog.catalog
 
     def show_document(self, archive_number: int) -> None:
         index = next(
