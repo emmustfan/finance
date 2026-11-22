@@ -1,4 +1,4 @@
-"""Versioned encrypted container for the stage-zero PDF prototype."""
+"""Authenticated storage for PDF and document archives."""
 
 from pathlib import Path
 import os
@@ -7,11 +7,13 @@ from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives.kdf.scrypt import Scrypt
 
 MAGIC = b"FVAULT\x01"
+DOCUMENT_MAGIC = b"FVAULT\x02"
 SALT_SIZE = 16
 NONCE_SIZE = 12
 HEADER_SIZE = len(MAGIC) + SALT_SIZE + NONCE_SIZE
 MAX_PDF = 20 * 1024 * 1024
-MAX_CONTAINER = HEADER_SIZE + MAX_PDF + 16
+MAX_DOCUMENT_DATA = 64 * 1024 * 1024
+MAX_CONTAINER = HEADER_SIZE + MAX_DOCUMENT_DATA + 16
 
 
 def _key(password: str, salt: bytes) -> bytes:
@@ -41,37 +43,49 @@ def _write_new(path: Path, data: bytes) -> None:
 
 def create(path: Path, pdf: bytes, password: str) -> None:
     _check_pdf(pdf)
+    _write_new(path, encrypt(pdf, password, MAGIC))
+
+
+def encrypt(payload: bytes, password: str, magic: bytes) -> bytes:
     if len(password) < 12:
         raise ValueError("Для нового архива нужен пароль от 12 символов.")
     salt = os.urandom(SALT_SIZE)
     nonce = os.urandom(NONCE_SIZE)
-    header = MAGIC + salt + nonce
+    header = magic + salt + nonce
     cipher = AESGCM(_key(password, salt))
-    _write_new(path, header + cipher.encrypt(nonce, pdf, header))
+    return header + cipher.encrypt(nonce, payload, header)
 
 
-def _read(path: Path) -> bytes:
+def read_container(path: Path) -> bytes:
     with path.open("rb") as stream:
         return stream.read(MAX_CONTAINER + 1)
 
 
-def _decrypt(data: bytes, password: str) -> bytes:
-    if not HEADER_SIZE + 16 <= len(data) <= MAX_CONTAINER or not data.startswith(MAGIC):
+def decrypt(data: bytes, password: str) -> tuple[bytes, bytes]:
+    magic = data[:len(MAGIC)]
+    if magic not in (MAGIC, DOCUMENT_MAGIC) or not HEADER_SIZE + 16 <= len(data) <= MAX_CONTAINER:
         raise ValueError("Неизвестный формат или поврежденный архив.")
     header = data[:HEADER_SIZE]
     salt = header[len(MAGIC):len(MAGIC) + SALT_SIZE]
     nonce = header[-NONCE_SIZE:]
-    pdf = AESGCM(_key(password, salt)).decrypt(nonce, data[HEADER_SIZE:], header)
-    _check_pdf(pdf)
-    return pdf
+    payload = AESGCM(_key(password, salt)).decrypt(nonce, data[HEADER_SIZE:], header)
+    if magic == MAGIC:
+        _check_pdf(payload)
+    return magic, payload
 
 
 def open_pdf(path: Path, password: str) -> bytes:
-    return _decrypt(_read(path), password)
+    magic, payload = decrypt(read_container(path), password)
+    if magic != MAGIC:
+        raise ValueError("Ожидается тестовый архив с одним PDF.")
+    return payload
 
 
 def copy_verified(source: Path, destination: Path, password: str) -> None:
     """Authenticate the exact bytes to be copied, without replacing existing files."""
-    data = _read(source)
-    _decrypt(data, password)
+    data = read_container(source)
+    magic, payload = decrypt(data, password)
+    if magic == DOCUMENT_MAGIC:
+        from documents import decode_cards
+        decode_cards(payload)
     _write_new(destination, data)

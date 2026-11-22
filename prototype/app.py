@@ -7,8 +7,9 @@ import pypdfium2 as pdfium
 from cryptography.exceptions import InvalidTag
 from PIL import ImageTk
 
+from documents import CARD_FIELDS, Card, Catalog, read_pdf
 from sample import sample_pdf
-from vault import copy_verified, create, open_pdf
+from vault import copy_verified, create
 
 VAULT_TYPES = [("Архив", "*.fvault")]
 
@@ -20,19 +21,42 @@ class ArchiveWindow:
         self.document = None
         self.image = None
         self.page = 0
+        self.catalog: Catalog | None = None
+        self.results: list[Card] = []
 
         root.title("Семейный архив")
         toolbar = ttk.Frame(root, padding=8)
         toolbar.pack(fill="x")
         for label, action in (
-            ("Создать тестовый архив", self.create_archive),
+            ("Новый архив", lambda: self.create_archive(False)),
+            ("Создать тестовый архив", lambda: self.create_archive(True)),
             ("Открыть архив", self.open_archive),
             ("Создать копию", lambda: self.copy_archive(False)),
             ("Восстановить из копии", lambda: self.copy_archive(True)),
         ):
             ttk.Button(toolbar, text=label, command=action).pack(side="left", padx=3)
 
-        controls = ttk.Frame(root, padding=8)
+        body = ttk.Frame(root, padding=8)
+        body.pack(fill="both", expand=True)
+        sidebar = ttk.Frame(body, width=260)
+        sidebar.pack(side="left", fill="y", padx=(0, 12))
+        ttk.Label(sidebar, text="Поиск документов").pack(anchor="w")
+        self.query = tk.StringVar()
+        ttk.Entry(sidebar, textvariable=self.query, width=29).pack(fill="x", pady=(3, 8))
+        self.add_button = ttk.Button(
+            sidebar, text="Добавить документ", command=self.add_card, state="disabled"
+        )
+        self.add_button.pack(fill="x", pady=(0, 8))
+        self.listbox = tk.Listbox(sidebar, width=29, height=12, exportselection=False)
+        self.listbox.pack(fill="both", expand=True)
+        self.listbox.bind("<<ListboxSelect>>", self.select_card)
+        self.query.trace_add("write", lambda *_: self.refresh_cards())
+
+        detail = ttk.Frame(body)
+        detail.pack(side="left", fill="both", expand=True)
+        self.details = ttk.Label(detail, wraplength=510, justify="left")
+        self.details.pack(anchor="w")
+        controls = ttk.Frame(detail, padding=(0, 8))
         controls.pack(fill="x")
         ttk.Button(controls, text="←", command=lambda: self.move_page(-1)).pack(side="left")
         ttk.Button(controls, text="→", command=lambda: self.move_page(1)).pack(side="left")
@@ -43,7 +67,7 @@ class ArchiveWindow:
             state="disabled",
         )
         self.print_button.pack(side="right")
-        self.preview = ttk.Label(root, anchor="center")
+        self.preview = ttk.Label(detail, anchor="center")
         self.preview.pack(fill="both", expand=True, padx=8, pady=8)
 
     def password(self, prompt: str) -> str | None:
@@ -67,8 +91,8 @@ class ArchiveWindow:
             detail = "Этот файл уже существует. Выберите другое имя."
         messagebox.showerror("Операция не выполнена", detail, parent=self.root)
 
-    def create_archive(self) -> None:
-        path = self.save_path("Создать тестовый архив")
+    def create_archive(self, sample: bool) -> None:
+        path = self.save_path("Создать тестовый архив" if sample else "Новый архив")
         if path is None:
             return
         password = self.password("Новый пароль, от 12 символов")
@@ -81,7 +105,10 @@ class ArchiveWindow:
             self.error(ValueError("Пароли не совпадают."))
             return
         try:
-            create(path, sample_pdf(), password)
+            if sample:
+                create(path, sample_pdf(), password)
+            else:
+                Catalog.create(path, password)
         except (OSError, ValueError) as exc:
             self.error(exc)
             return
@@ -96,21 +123,85 @@ class ArchiveWindow:
             self.show_archive(path, password)
 
     def show_archive(self, path: Path, password: str) -> None:
-        document = None
         try:
-            pdf = open_pdf(path, password)
-            document = pdfium.PdfDocument(pdf)
-            image = self.render(document, 0)
-        except (OSError, ValueError, InvalidTag, pdfium.PdfiumError, tk.TclError) as exc:
-            if document is not None:
-                document.close()
+            catalog = Catalog.open(path, password)
+        except (OSError, ValueError, InvalidTag) as exc:
             self.error(exc)
             return
+        self.catalog = catalog
+        self.root.title(f"Семейный архив — {path.name}")
+        self.add_button.configure(state="disabled" if catalog.legacy else "normal")
+        if self.query.get():
+            self.query.set("")
+        else:
+            self.refresh_cards()
+
+    def refresh_cards(self) -> None:
+        cards = self.catalog.cards if self.catalog is not None else ()
+        self.results = [card for card in cards if card.matches(self.query.get())]
+        self.listbox.delete(0, "end")
+        for card in self.results:
+            caption = f"{card.title} · {card.number}" if card.number else card.title
+            self.listbox.insert("end", caption)
+        if self.results:
+            self.listbox.selection_set(0)
+        self.select_card()
+
+    def select_card(self, _event=None) -> None:
+        selected = self.listbox.curselection()
         if self.document is not None:
             self.document.close()
-        self.document, self.pdf = document, pdf
+        self.document = self.pdf = self.image = None
+        self.preview.configure(image="")
+        self.print_button.configure(state="disabled")
+        self.details.configure(text="")
+        self.status.configure(text="Документы не найдены" if self.catalog else "Откройте архив")
+        if not selected:
+            return
+        card = self.results[selected[0]]
+        lines = [f"{label}: {getattr(card, key)}" for key, label in CARD_FIELDS[:8] if getattr(card, key)]
+        if card.address:
+            lines.append(f"Оригинал: {card.address}")
+        self.details.configure(text="\n".join(lines))
+        self.status.configure(text="У документа нет PDF")
+        if card.pdf is None:
+            return
+        document = None
+        try:
+            document = pdfium.PdfDocument(card.pdf)
+            image = self.render(document, 0)
+        except (OSError, ValueError, IndexError, pdfium.PdfiumError, tk.TclError) as exc:
+            if document is not None:
+                document.close()
+            self.status.configure(text="Не удалось открыть PDF")
+            self.error(exc)
+            return
+        self.document, self.pdf = document, card.pdf
         self.set_page(image, 0)
         self.print_button.configure(state="normal")
+
+    def add_card(self) -> None:
+        if self.catalog is None or self.catalog.legacy:
+            return
+        dialog = CardDialog(self.root, "Новый документ")
+        if dialog.result is None:
+            return
+        password = self.password("Введите пароль архива, чтобы сохранить документ")
+        if password is None:
+            return
+        try:
+            self.catalog = self.catalog.add(dialog.result, password)
+        except (OSError, ValueError, InvalidTag) as exc:
+            self.error(exc)
+            return
+        if self.query.get():
+            self.query.set("")
+        else:
+            self.refresh_cards()
+        self.listbox.selection_clear(0, "end")
+        self.listbox.selection_set("end")
+        self.listbox.see("end")
+        self.select_card()
 
     @staticmethod
     def render(document, index: int):
@@ -165,7 +256,7 @@ class ArchiveWindow:
             return
         try:
             result = subprocess.run(
-                ["/usr/bin/lp", "-t", "Family archive test", "-"],
+                ["/usr/bin/lp", "-t", "Family archive PDF", "-"],
                 input=self.pdf, capture_output=True, timeout=30, check=False,
             )
             if result.returncode:
@@ -176,9 +267,53 @@ class ArchiveWindow:
         messagebox.showinfo("Печать", "Задание передано в очередь печати.", parent=self.root)
 
 
+class CardDialog(simpledialog.Dialog):
+    def body(self, master):
+        self.pdf = None
+        self.inputs = {}
+        for row, (key, label) in enumerate(CARD_FIELDS):
+            ttk.Label(master, text=label).grid(row=row, column=0, sticky="w", padx=6, pady=2)
+            entry = ttk.Entry(master, width=40)
+            entry.grid(row=row, column=1, sticky="ew", padx=6, pady=2)
+            self.inputs[key] = entry
+        row = len(CARD_FIELDS)
+        ttk.Button(master, text="Выбрать PDF…", command=self.choose_pdf).grid(row=row, column=0)
+        self.filename = ttk.Label(master, text="PDF не выбран", wraplength=270)
+        self.filename.grid(row=row, column=1, sticky="w", padx=6, pady=6)
+        return self.inputs["title"]
+
+    def choose_pdf(self) -> None:
+        filename = filedialog.askopenfilename(
+            title="Выберите PDF", filetypes=[("PDF", "*.pdf")], parent=self
+        )
+        if not filename:
+            return
+        try:
+            path = Path(filename)
+            pdf = read_pdf(path)
+            with pdfium.PdfDocument(pdf) as doc:
+                if len(doc) == 0:
+                    raise ValueError("В PDF нет страниц.")
+        except (OSError, ValueError, pdfium.PdfiumError) as exc:
+            messagebox.showerror("Не удалось приложить PDF", str(exc), parent=self)
+            return
+        self.pdf = pdf
+        self.filename.configure(text=path.name)
+
+    def validate(self):
+        card = Card(**{key: entry.get().strip() for key, entry in self.inputs.items()}, pdf=self.pdf)
+        try:
+            card.validate()
+        except ValueError as exc:
+            messagebox.showerror("Проверьте карточку", str(exc), parent=self)
+            return False
+        self.result = card
+        return True
+
+
 def main() -> None:
     root = tk.Tk()
-    root.minsize(710, 690)
+    root.minsize(835, 690)
     ArchiveWindow(root)
     root.mainloop()
 
