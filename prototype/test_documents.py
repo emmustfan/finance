@@ -62,12 +62,45 @@ class DocumentTest(unittest.TestCase):
         self.assertEqual(Catalog.open(self.path, PASSWORD), latest)
         self.assertEqual(stat.S_IMODE(self.path.stat().st_mode), 0o600)
 
-    def test_stage_zero_archive_opens_with_its_pdf(self):
+    def test_stage_zero_archive_can_be_edited_with_its_pdf_intact(self):
         pdf = sample_pdf()
         create(self.path, pdf, PASSWORD)
         catalog = Catalog.open(self.path, PASSWORD)
-        self.assertTrue(catalog.legacy)
+        self.assertTrue(catalog.editable)
+        tagged = catalog.set_tags(0, "Анна, 2024", PASSWORD)
+        tagged.add(Card("Квитанция", folder="03"), PASSWORD)
+        reopened = Catalog.open(self.path, PASSWORD)
+        self.assertEqual(reopened.cards[0], Card("Тестовый документ", tags="Анна, 2024", pdf=pdf))
+        self.assertEqual(reopened.cards[1].title, "Квитанция")
+
+    def test_new_sample_archive_can_add_cards_and_edit_tags(self):
+        sample = Card("Тестовый документ", pdf=sample_pdf())
+        catalog = Catalog.create(self.path, PASSWORD, cards=(sample,))
+        self.assertTrue(catalog.editable)
+        updated = catalog.add(Card("Квитанция", folder="03"), PASSWORD)
+        updated.set_tags(0, "Анна", PASSWORD)
+        reopened = Catalog.open(self.path, PASSWORD)
+        self.assertEqual(reopened.cards[0].tags, "Анна")
+        self.assertEqual(reopened.cards[0].pdf, sample.pdf)
+        self.assertEqual(reopened.cards[1].title, "Квитанция")
+
+    def test_shared_archive_opens_for_reading_and_copies_to_editable_file(self):
+        pdf = sample_pdf()
+        create(self.path, pdf, PASSWORD)
+        self.path.chmod(0o640)
+        original = self.path.read_bytes()
+
+        catalog = Catalog.open(self.path, PASSWORD)
+        self.assertFalse(catalog.editable)
         self.assertEqual(catalog.cards[0].pdf, pdf)
+        with self.assertRaisesRegex(ValueError, "с приватными правами"):
+            catalog.set_tags(0, "Анна", PASSWORD)
+        self.assertEqual(self.path.read_bytes(), original)
+        self.assertEqual(stat.S_IMODE(self.path.stat().st_mode), 0o640)
+
+        personal = self.root / "personal.fvault"
+        copy_verified(self.path, personal, PASSWORD)
+        self.assertTrue(Catalog.open(personal, PASSWORD).editable)
 
     def test_tags_filter_exactly_and_combine_with_search(self):
         catalog = Catalog.create(self.path, PASSWORD)

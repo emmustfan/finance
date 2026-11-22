@@ -9,7 +9,7 @@ from PIL import ImageTk
 
 from documents import CARD_FIELDS, Card, Catalog, read_pdf, tag_names
 from sample import sample_pdf
-from vault import copy_verified, create
+from vault import copy_verified
 
 VAULT_TYPES = [("Архив", "*.fvault")]
 
@@ -22,6 +22,7 @@ class ArchiveWindow:
         self.image = None
         self.page = 0
         self.catalog: Catalog | None = None
+        self.can_edit = False
         self.results: list[int] = []
 
         root.title("Семейный архив")
@@ -57,6 +58,11 @@ class ArchiveWindow:
             sidebar, text="Добавить документ", command=self.add_card, state="disabled"
         )
         self.add_button.pack(fill="x", pady=(0, 8))
+        self.archive_hint = ttk.Label(
+            sidebar, text="Создайте или откройте архив, чтобы добавить документ.",
+            wraplength=240, justify="left",
+        )
+        self.archive_hint.pack(anchor="w", pady=(0, 8))
         self.listbox = tk.Listbox(sidebar, width=29, height=12, exportselection=False)
         self.listbox.pack(fill="both", expand=True)
         self.listbox.bind("<<ListboxSelect>>", self.select_card)
@@ -119,14 +125,12 @@ class ArchiveWindow:
             self.error(ValueError("Пароли не совпадают."))
             return
         try:
-            if sample:
-                create(path, sample_pdf(), password)
-            else:
-                Catalog.create(path, password)
+            cards = (Card("Тестовый документ", pdf=sample_pdf()),) if sample else ()
+            catalog = Catalog.create(path, password, cards=cards)
         except (OSError, ValueError) as exc:
             self.error(exc)
             return
-        self.show_archive(path, password)
+        self.show_catalog(catalog)
 
     def open_archive(self) -> None:
         path = self.source_path("Открыть архив")
@@ -142,9 +146,21 @@ class ArchiveWindow:
         except (OSError, ValueError, InvalidTag) as exc:
             self.error(exc)
             return
+        self.show_catalog(catalog)
+
+    def show_catalog(self, catalog: Catalog) -> None:
         self.catalog = catalog
-        self.root.title(f"Семейный архив — {path.name}")
-        self.add_button.configure(state="disabled" if catalog.legacy else "normal")
+        self.can_edit = catalog.editable
+        self.root.title(f"Семейный архив — {catalog.path.name}")
+        self.add_button.configure(state="normal" if self.can_edit else "disabled")
+        if self.can_edit:
+            self.archive_hint.pack_forget()
+        else:
+            self.archive_hint.configure(
+                text="Архив открыт для просмотра. Чтобы редактировать, сохраните личную "
+                "копию через «Восстановить из копии»."
+            )
+            self.archive_hint.pack(anchor="w", pady=(0, 8), before=self.listbox)
         self.tag_filter.set("")
         self.refresh_tags()
         if self.query.get():
@@ -193,7 +209,7 @@ class ArchiveWindow:
         if not selected or self.catalog is None:
             return
         card = self.catalog.cards[self.results[selected[0]]]
-        if not self.catalog.legacy:
+        if self.can_edit:
             self.edit_tags_button.configure(state="normal")
         lines = [f"{label}: {getattr(card, key)}" for key, label in CARD_FIELDS[:8] if getattr(card, key)]
         if card.address:
@@ -217,7 +233,7 @@ class ArchiveWindow:
         self.print_button.configure(state="normal")
 
     def add_card(self) -> None:
-        if self.catalog is None or self.catalog.legacy:
+        if self.catalog is None or not self.can_edit:
             return
         dialog = CardDialog(self.root, "Новый документ")
         if dialog.result is None:
@@ -239,7 +255,7 @@ class ArchiveWindow:
 
     def edit_tags(self) -> None:
         selected = self.listbox.curselection()
-        if not selected or self.catalog is None or self.catalog.legacy:
+        if not selected or self.catalog is None or not self.can_edit:
             return
         index = self.results[selected[0]]
         current = self.catalog.cards[index].tags
@@ -330,18 +346,29 @@ class CardDialog(simpledialog.Dialog):
     def body(self, master):
         self.pdf = None
         self.inputs = {}
-        for row, (key, label) in enumerate(CARD_FIELDS):
-            if key == "tags":
-                label = "Теги через запятую"
+        ttk.Label(
+            master, text="Укажите название. Приложите PDF или заполните поле «Шкаф или "
+            "место хранения» либо «Папка».", wraplength=400, justify="left",
+        ).grid(row=0, column=0, columnspan=2, sticky="w", padx=6, pady=(4, 8))
+        for row, (key, label) in enumerate(CARD_FIELDS, start=1):
+            label = {"title": "Название (обязательно)", "tags": "Теги через запятую"}.get(key, label)
             ttk.Label(master, text=label).grid(row=row, column=0, sticky="w", padx=6, pady=2)
             entry = ttk.Entry(master, width=40)
             entry.grid(row=row, column=1, sticky="ew", padx=6, pady=2)
             self.inputs[key] = entry
-        row = len(CARD_FIELDS)
+        row = len(CARD_FIELDS) + 1
         ttk.Button(master, text="Выбрать PDF…", command=self.choose_pdf).grid(row=row, column=0)
         self.filename = ttk.Label(master, text="PDF не выбран", wraplength=270)
         self.filename.grid(row=row, column=1, sticky="w", padx=6, pady=6)
         return self.inputs["title"]
+
+    def buttonbox(self):
+        buttons = ttk.Frame(self, padding=8)
+        ttk.Button(buttons, text="Сохранить", command=self.ok).pack(side="left", padx=4)
+        ttk.Button(buttons, text="Отмена", command=self.cancel).pack(side="left", padx=4)
+        self.bind("<Return>", self.ok)
+        self.bind("<Escape>", self.cancel)
+        buttons.pack()
 
     def choose_pdf(self) -> None:
         filename = filedialog.askopenfilename(

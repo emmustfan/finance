@@ -120,7 +120,6 @@ class Catalog:
     path: Path
     cards: tuple[Card, ...]
     revision: bytes
-    legacy: bool = False
 
     @classmethod
     def open(cls, path: Path, password: str) -> "Catalog":
@@ -129,16 +128,15 @@ class Catalog:
     @classmethod
     def _from_container(cls, path: Path, data: bytes, password: str) -> "Catalog":
         magic, payload = decrypt(data, password)
-        legacy = magic == MAGIC
-        cards = (Card("Тестовый документ", pdf=payload),) if legacy else decode_cards(payload)
-        return cls(path, cards, hashlib.sha256(data).digest(), legacy)
+        cards = (Card("Тестовый документ", pdf=payload),) if magic == MAGIC else decode_cards(payload)
+        return cls(path, cards, hashlib.sha256(data).digest())
 
     @classmethod
-    def create(cls, path: Path, password: str) -> "Catalog":
+    def create(cls, path: Path, password: str, *, cards: tuple[Card, ...] = ()) -> "Catalog":
         path = path.parent.resolve() / path.name
-        data = encrypt(_encode_cards(()), password, DOCUMENT_MAGIC)
+        data = encrypt(_encode_cards(cards), password, DOCUMENT_MAGIC)
         _write_new(path, data)
-        return cls(path, (), hashlib.sha256(data).digest())
+        return cls(path, cards, hashlib.sha256(data).digest())
 
     def add(self, card: Card, password: str) -> "Catalog":
         card = replace(card, tags=", ".join(tag_names(card.tags)))
@@ -159,17 +157,32 @@ class Catalog:
         cards = (*self.cards[:index], card, *self.cards[index + 1:])
         return self._save(cards, password)
 
+    @property
+    def editable(self) -> bool:
+        try:
+            mode = self.path.lstat()
+        except OSError:
+            return False
+        return (
+            stat.S_ISREG(mode.st_mode)
+            and mode.st_uid == os.getuid()
+            and bool(mode.st_mode & stat.S_IWUSR)
+            and not mode.st_mode & 0o077
+            and os.access(self.path.parent, os.W_OK | os.X_OK)
+        )
+
+    def _check_editable(self) -> None:
+        if not self.editable:
+            raise ValueError("Для изменения нужен архив владельца с приватными правами доступа.")
+
     def _save(self, cards: tuple[Card, ...], password: str) -> "Catalog":
-        if self.legacy:
-            raise ValueError("Создайте новый архив документов, чтобы сохранять изменения.")
+        self._check_editable()
         payload = _encode_cards(cards)
         lock_path = self.path.with_name(f".{self.path.name}.lock")
         fd = os.open(lock_path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
         with os.fdopen(fd, "rb+") as lock:
             fcntl.flock(lock, fcntl.LOCK_EX)
-            mode = self.path.lstat()
-            if not stat.S_ISREG(mode.st_mode) or mode.st_uid != os.getuid() or mode.st_mode & 0o077:
-                raise ValueError("Для изменения нужен архив владельца с приватными правами доступа.")
+            self._check_editable()
             existing = read_container(self.path)
             if hashlib.sha256(existing).digest() != self.revision:
                 raise ValueError("Архив изменился. Откройте его заново и повторите изменение.")
