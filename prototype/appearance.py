@@ -4,7 +4,10 @@ from zlib import crc32
 
 from PySide6.QtCore import QPoint, QRect, QSize, Qt, Signal
 from PySide6.QtGui import QFont, QFontDatabase
-from PySide6.QtWidgets import QApplication, QLayout, QLineEdit, QPushButton, QVBoxLayout, QWidget
+from PySide6.QtWidgets import (
+    QApplication, QComboBox, QFrame, QLabel, QLayout, QLineEdit, QPushButton, QScrollArea, QToolButton,
+    QVBoxLayout, QWidget,
+)
 
 from documents import tag_names
 
@@ -100,6 +103,38 @@ def apply_style(app: QApplication) -> None:
     app.setStyleSheet(STYLE)
 
 
+def label(text="", style="", *, wrap=False) -> QLabel:
+    widget = QLabel(text)
+    widget.setObjectName(style)
+    widget.setTextFormat(Qt.TextFormat.PlainText)
+    widget.setWordWrap(wrap)
+    return widget
+
+
+def button(text, action, *, primary=False, sidebar=False) -> QPushButton:
+    widget = QPushButton(text)
+    widget.setProperty("primary", primary)
+    widget.setProperty("sidebar", sidebar)
+    widget.setAutoDefault(False)
+    widget.setCursor(Qt.CursorShape.PointingHandCursor)
+    widget.clicked.connect(action)
+    return widget
+
+
+def frame(style, parent=None) -> QFrame:
+    widget = QFrame(parent)
+    widget.setObjectName(style)
+    return widget
+
+
+def area(widget) -> QScrollArea:
+    view = QScrollArea()
+    view.setWidget(widget)
+    view.setWidgetResizable(True)
+    view.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+    return view
+
+
 def tag_button(name: str, *, remove: bool = False) -> QPushButton:
     background, ink, border = PALETTES[crc32(name.casefold().encode()) % len(PALETTES)]
     caption = name.replace("&", "&&")
@@ -117,6 +152,21 @@ def tag_button(name: str, *, remove: bool = False) -> QPushButton:
         QPushButton:pressed {{ background: {border}; }}
     """)
     return button
+
+
+class ChoiceBox(QComboBox):
+    def __init__(self):
+        super().__init__()
+        self.toggle = QToolButton(self)
+        self.toggle.setObjectName("typeToggle")
+        self.toggle.setText("▾")
+        self.toggle.setAccessibleName("Открыть список")
+        self.toggle.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.toggle.clicked.connect(self.showPopup)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self.toggle.setGeometry(self.width() - 29, (self.height() - 26) // 2, 25, 26)
 
 
 class TagFlow(QLayout):

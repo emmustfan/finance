@@ -105,6 +105,6 @@ def copy_verified(source: Path, destination: Path, password: str) -> None:
     data = read_container(source)
     magic, payload = decrypt(data, password)
     if magic == DOCUMENT_MAGIC:
-        from documents import decode_cards
-        decode_cards(payload)
+        from documents import decode_catalog
+        decode_catalog(payload)
     _write_new(destination, data)

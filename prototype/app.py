@@ -14,51 +14,21 @@ from PySide6.QtPrintSupport import QPrintDialog, QPrinter
 from PySide6.QtWidgets import (
     QAbstractItemView, QApplication, QComboBox, QDialog, QFileDialog, QFrame,
     QHBoxLayout, QHeaderView, QInputDialog,
-    QLabel, QLineEdit, QListWidget, QListWidgetItem, QMainWindow, QMenu, QMessageBox,
-    QPushButton, QScrollArea, QSizePolicy, QSplitter, QTableWidget, QTableWidgetItem,
+    QLineEdit, QListWidget, QListWidgetItem, QMainWindow, QMenu, QMessageBox,
+    QSizePolicy, QSplitter, QTableWidget, QTableWidgetItem,
     QToolButton, QVBoxLayout, QWidget,
 )
 from PIL.ImageQt import ImageQt
 from PIL import Image
 
-from appearance import TagEditor, TagFlow, apply_style, clear_tags, tag_button
+from appearance import ChoiceBox, TagEditor, TagFlow, apply_style, area, button, clear_tags, frame, label, tag_button
+from asset_views import RegistryDialog
+from assets import Asset
 from documents import CARD_FIELDS, MAX_ATTACHMENT_BYTES, Card, Catalog, Photo, read_pdf, read_photo, tag_names
 from sample import sample_pdf
 from vault import copy_verified
 
 VAULT_FILTER = "Семейный архив (*.fvault)"
-
-
-def label(text="", style="", *, wrap=False) -> QLabel:
-    widget = QLabel(text)
-    widget.setObjectName(style)
-    widget.setTextFormat(Qt.TextFormat.PlainText)
-    widget.setWordWrap(wrap)
-    return widget
-
-
-def button(text, action, *, primary=False, sidebar=False) -> QPushButton:
-    widget = QPushButton(text)
-    widget.setProperty("primary", primary)
-    widget.setProperty("sidebar", sidebar)
-    widget.setAutoDefault(False)
-    widget.setCursor(Qt.CursorShape.PointingHandCursor)
-    widget.clicked.connect(action)
-    return widget
-
-
-def frame(style, parent=None) -> QFrame:
-    widget = QFrame(parent)
-    widget.setObjectName(style)
-    return widget
-
-
-def area(widget) -> QScrollArea:
-    view = QScrollArea()
-    view.setWidget(widget)
-    view.setWidgetResizable(True)
-    view.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-    return view
 
 
 class AttachmentPreview(QFrame):
@@ -239,21 +209,6 @@ class AttachmentPreview(QFrame):
             self.report_error(exc)
             return
         QMessageBox.information(self, "Печать", "Задание передано в очередь печати.")
-
-
-class ChoiceBox(QComboBox):
-    def __init__(self):
-        super().__init__()
-        self.toggle = QToolButton(self)
-        self.toggle.setObjectName("typeToggle")
-        self.toggle.setText("▾")
-        self.toggle.setAccessibleName("Открыть список типов")
-        self.toggle.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.toggle.clicked.connect(self.showPopup)
-
-    def resizeEvent(self, event):
-        super().resizeEvent(event)
-        self.toggle.setGeometry(self.width() - 29, (self.height() - 26) // 2, 25, 26)
 
 
 class DocumentTypeBox(ChoiceBox):
@@ -658,6 +613,8 @@ class ArchiveWindow(QMainWindow):
         layout.addWidget(button("Новый архив…", lambda: self.create_archive(False), sidebar=True))
         self.folders_button = button("Бумажные папки…", self.open_folders, sidebar=True)
         layout.addWidget(self.folders_button)
+        self.assets_button = button("Счета и активы…", self.open_registry, sidebar=True)
+        layout.addWidget(self.assets_button)
         layout.addSpacing(12)
         layout.addWidget(label("ТЕГИ", "sideSection"))
         self.all_documents = button("Все документы", lambda: self.set_tag(""), sidebar=True)
@@ -802,7 +759,15 @@ class ArchiveWindow(QMainWindow):
                 Card("Паспорт", kind="Паспорт", party="Анна", tags="Анна, Семья", folder="02 · Личные документы"),
                 Card("Договор обслуживания", kind="Договор", tags="Дом, 2025", folder="03 · Недвижимость"),
             ) if demo else ()
-            catalog = Catalog.create(path, password, cards=cards)
+            assets = (
+                Asset("Квартира", "property", "Семья", kind="Квартира",
+                      amount=850_000_000, as_of="2026-11-01",
+                      access_pointer="Семейные доступы → Страхование → Полис квартиры",
+                      document_numbers=(1, 3)),
+                Asset("Семейные накопления", "account", "Анна", kind="Накопительный счёт",
+                      organization="Пример банка", amount=8_000_000, as_of="2026-11-01"),
+            ) if demo else ()
+            catalog = Catalog.create(path, password, cards=cards, assets=assets)
         except (OSError, ValueError) as exc:
             self.error(exc)
             return
@@ -834,6 +799,7 @@ class ArchiveWindow(QMainWindow):
         self.close_action.setEnabled(catalog is not None)
         self.search.setEnabled(catalog is not None)
         self.folders_button.setEnabled(catalog is not None)
+        self.assets_button.setEnabled(catalog is not None)
         self.add_button.setEnabled(catalog is not None and catalog.editable)
         self.search.blockSignals(True)
         self.search.clear()
@@ -845,11 +811,25 @@ class ArchiveWindow(QMainWindow):
         if self.catalog is None:
             return
         dialog = FolderDialog(self, self.catalog)
-        if dialog.exec() != QDialog.DialogCode.Accepted or dialog.archive_number is None:
+        if dialog.exec() == QDialog.DialogCode.Accepted and dialog.archive_number is not None:
+            self.show_document(dialog.archive_number)
+
+    def open_registry(self) -> None:
+        if self.catalog is None:
             return
+        dialog = RegistryDialog(self, self.catalog)
+        result = dialog.exec()
+        self.catalog = dialog.catalog
+        if result == QDialog.DialogCode.Accepted and dialog.document_number is not None:
+            self.show_document(dialog.document_number)
+
+    def show_document(self, archive_number: int) -> None:
         index = next(
-            idx for idx, card in enumerate(self.catalog.cards) if card.archive_number == dialog.archive_number
+            (idx for idx, card in enumerate(self.catalog.cards) if card.archive_number == archive_number),
+            None,
         )
+        if index is None:
+            return
         self.active_tag = ""
         self.search.blockSignals(True)
         self.search.clear()
