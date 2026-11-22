@@ -7,19 +7,25 @@ import json
 import os
 import stat
 import tempfile
-from dataclasses import asdict, dataclass, fields, replace
+from dataclasses import asdict, dataclass, field, fields, replace
 from pathlib import Path
 
 from vault import (
-    DOCUMENT_MAGIC, MAGIC, MAX_DOCUMENT_DATA, MAX_PDF, _check_pdf, _write_new,
-    decrypt, encrypt, read_container,
+    DOCUMENT_MAGIC, MAGIC, MAX_DOCUMENT_DATA, MAX_PDF, UnlockedVault, _check_pdf,
+    _write_new, read_container,
 )
 
 CARD_FIELDS = (
-    ("title", "Название"), ("kind", "Тип"), ("number", "Номер"),
+    ("title", "Название"), ("kind", "Тип"), ("number", "Номер на оригинале"),
     ("date", "Дата"), ("expires", "Срок действия"), ("party", "Человек или организация"),
     ("tags", "Теги"), ("note", "Примечание"), ("cabinet", "Шкаф или место хранения"),
     ("folder", "Папка"), ("section", "Раздел"), ("position", "Номер в папке"),
+)
+
+DEFAULT_KINDS = (
+    "Паспорт", "Свидетельство", "Удостоверение", "Водительские права",
+    "Страховой полис", "Договор", "Квитанция", "Справка", "Выписка",
+    "Доверенность", "Медицинский документ", "Документ на имущество",
 )
 
 
@@ -49,6 +55,11 @@ class Card:
     section: str = ""
     position: str = ""
     pdf: bytes | None = None
+    archive_number: int = 0
+
+    @property
+    def archive_label(self) -> str:
+        return f"{self.archive_number:04d}" if self.archive_number else ""
 
     def validate(self) -> None:
         if any(not isinstance(getattr(self, key), str) for key, _ in CARD_FIELDS):
@@ -65,7 +76,8 @@ class Card:
         if tag and not any(name.casefold() == tag for name in tag_names(self.tags)):
             return False
         searchable = " ".join(
-            (self.title, self.number, self.party, self.kind, self.tags, self.folder)
+            (self.title, self.number, self.party, self.kind, self.tags, self.folder,
+             self.archive_label)
         ).casefold()
         return all(term in searchable for term in query.casefold().split())
 
@@ -101,10 +113,15 @@ def decode_cards(payload: bytes) -> tuple[Card, ...]:
         if not isinstance(items, list):
             raise ValueError("Ожидается список карточек.")
         cards = []
-        expected = {field.name for field in fields(Card)}
-        for item in items:
-            if not isinstance(item, dict) or set(item) != expected:
+        required = {field.name for field in fields(Card)} - {"archive_number"}
+        numbers = set()
+        for index, item in enumerate(items, start=1):
+            if not isinstance(item, dict) or set(item) - {"archive_number"} != required:
                 raise ValueError("Некорректная карточка документа.")
+            number = item.setdefault("archive_number", index)
+            if type(number) is not int or number < 1 or number in numbers:
+                raise ValueError("Некорректный номер карточки.")
+            numbers.add(number)
             if item["pdf"] is not None:
                 item["pdf"] = base64.b64decode(item["pdf"], validate=True)
             card = Card(**item)
@@ -120,27 +137,37 @@ class Catalog:
     path: Path
     cards: tuple[Card, ...]
     revision: bytes
+    _unlocked: UnlockedVault = field(repr=False, compare=False)
 
     @classmethod
     def open(cls, path: Path, password: str) -> "Catalog":
-        return cls._from_container(path.resolve(), read_container(path), password)
-
-    @classmethod
-    def _from_container(cls, path: Path, data: bytes, password: str) -> "Catalog":
-        magic, payload = decrypt(data, password)
-        cards = (Card("Тестовый документ", pdf=payload),) if magic == MAGIC else decode_cards(payload)
-        return cls(path, cards, hashlib.sha256(data).digest())
+        path = path.resolve()
+        data = read_container(path)
+        unlocked, magic, payload = UnlockedVault.open(data, password)
+        cards = (Card("Тестовый документ", pdf=payload, archive_number=1),) if magic == MAGIC else decode_cards(payload)
+        return cls(path, cards, hashlib.sha256(data).digest(), unlocked)
 
     @classmethod
     def create(cls, path: Path, password: str, *, cards: tuple[Card, ...] = ()) -> "Catalog":
         path = path.parent.resolve() / path.name
-        data = encrypt(_encode_cards(cards), password, DOCUMENT_MAGIC)
+        cards = tuple(replace(card, archive_number=index) for index, card in enumerate(cards, start=1))
+        unlocked = UnlockedVault.create(password)
+        data = unlocked.encrypt(_encode_cards(cards), DOCUMENT_MAGIC)
         _write_new(path, data)
-        return cls(path, cards, hashlib.sha256(data).digest())
+        return cls(path, cards, hashlib.sha256(data).digest(), unlocked)
 
-    def add(self, card: Card, password: str) -> "Catalog":
-        card = replace(card, tags=", ".join(tag_names(card.tags)))
-        return self._save((*self.cards, card), password)
+    def add(self, card: Card) -> "Catalog":
+        number = max((existing.archive_number for existing in self.cards), default=0) + 1
+        card = replace(card, archive_number=number, tags=", ".join(tag_names(card.tags)))
+        return self._save((*self.cards, card))
+
+    @property
+    def available_kinds(self) -> tuple[str, ...]:
+        kinds = {kind.casefold(): kind for kind in DEFAULT_KINDS}
+        for card in self.cards:
+            if card.kind:
+                kinds.setdefault(card.kind.casefold(), card.kind)
+        return tuple(kinds[key] for key in sorted(kinds))
 
     @property
     def available_tags(self) -> tuple[str, ...]:
@@ -150,12 +177,29 @@ class Catalog:
                 names.setdefault(name.casefold(), name)
         return tuple(names[key] for key in sorted(names))
 
-    def set_tags(self, index: int, value: str, password: str) -> "Catalog":
+    def set_tags(self, index: int, value: str) -> "Catalog":
         if not 0 <= index < len(self.cards):
             raise ValueError("Документ не найден.")
-        card = replace(self.cards[index], tags=", ".join(tag_names(value)))
+        return self.update(index, replace(self.cards[index], tags=value))
+
+    def update(self, index: int, card: Card) -> "Catalog":
+        if not 0 <= index < len(self.cards):
+            raise ValueError("Документ не найден.")
+        card = replace(
+            card, archive_number=self.cards[index].archive_number,
+            tags=", ".join(tag_names(card.tags)),
+        )
         cards = (*self.cards[:index], card, *self.cards[index + 1:])
-        return self._save(cards, password)
+        return self._save(cards)
+
+    def _read_current(self) -> bytes:
+        data = read_container(self.path)
+        if hashlib.sha256(data).digest() != self.revision:
+            raise ValueError("Архив изменился. Откройте его заново и повторите действие.")
+        return data
+
+    def backup(self, destination: Path) -> None:
+        _write_new(destination, self._read_current())
 
     @property
     def editable(self) -> bool:
@@ -175,7 +219,7 @@ class Catalog:
         if not self.editable:
             raise ValueError("Для изменения нужен архив владельца с приватными правами доступа.")
 
-    def _save(self, cards: tuple[Card, ...], password: str) -> "Catalog":
+    def _save(self, cards: tuple[Card, ...]) -> "Catalog":
         self._check_editable()
         payload = _encode_cards(cards)
         lock_path = self.path.with_name(f".{self.path.name}.lock")
@@ -183,11 +227,8 @@ class Catalog:
         with os.fdopen(fd, "rb+") as lock:
             fcntl.flock(lock, fcntl.LOCK_EX)
             self._check_editable()
-            existing = read_container(self.path)
-            if hashlib.sha256(existing).digest() != self.revision:
-                raise ValueError("Архив изменился. Откройте его заново и повторите изменение.")
-            decrypt(existing, password)
-            data = encrypt(payload, password, DOCUMENT_MAGIC)
+            self._read_current()
+            data = self._unlocked.encrypt(payload, DOCUMENT_MAGIC)
             with tempfile.NamedTemporaryFile(dir=self.path.parent, delete=False) as stream:
                 temporary = Path(stream.name)
                 try:
@@ -198,4 +239,4 @@ class Catalog:
                     os.replace(temporary, self.path)
                 finally:
                     temporary.unlink(missing_ok=True)
-        return Catalog(self.path, cards, hashlib.sha256(data).digest())
+        return replace(self, cards=cards, revision=hashlib.sha256(data).digest())

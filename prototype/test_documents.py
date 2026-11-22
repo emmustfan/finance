@@ -1,3 +1,5 @@
+from dataclasses import asdict
+import json
 import stat
 import tempfile
 import unittest
@@ -7,7 +9,7 @@ from cryptography.exceptions import InvalidTag
 
 from documents import Card, Catalog, read_pdf
 from sample import sample_pdf
-from vault import copy_verified, create
+from vault import DOCUMENT_MAGIC, HEADER_SIZE, NONCE_SIZE, copy_verified, create, encrypt
 
 PASSWORD = "sample family password"
 
@@ -28,9 +30,8 @@ class DocumentTest(unittest.TestCase):
             Card("Договор", kind="Договор", number="А-237", party="Анна",
                  tags="Дом", cabinet="Шкаф", folder="03", section="2",
                  position="07", pdf=read_pdf(input_path)),
-            PASSWORD,
         )
-        catalog.add(Card("Квитанция", folder="05"), PASSWORD)
+        catalog.add(Card("Квитанция", folder="05"))
         input_path.unlink()
 
         backup = self.root / "backup.fvault"
@@ -47,18 +48,18 @@ class DocumentTest(unittest.TestCase):
         self.assertEqual(found.pdf, pdf)
         self.assertIsNone(restored.cards[1].pdf)
 
-    def test_rejects_invalid_card_password_and_stale_writer(self):
+    def test_rejects_invalid_card_wrong_archive_password_and_stale_writer(self):
         original = Catalog.create(self.path, PASSWORD)
         card = Card("Квитанция", folder="05")
         with self.assertRaises(ValueError):
-            original.add(Card("Без оригинала и файла"), PASSWORD)
+            original.add(Card("Без оригинала и файла"))
         with self.assertRaises(InvalidTag):
-            original.add(card, "different test password")
+            Catalog.open(self.path, "different test password")
         self.assertEqual(Catalog.open(self.path, PASSWORD).cards, ())
 
-        latest = original.add(card, PASSWORD)
+        latest = original.add(card)
         with self.assertRaisesRegex(ValueError, "Архив изменился"):
-            original.add(Card("Другая карточка", folder="05"), PASSWORD)
+            original.add(Card("Другая карточка", folder="05"))
         self.assertEqual(Catalog.open(self.path, PASSWORD), latest)
         self.assertEqual(stat.S_IMODE(self.path.stat().st_mode), 0o600)
 
@@ -67,18 +68,18 @@ class DocumentTest(unittest.TestCase):
         create(self.path, pdf, PASSWORD)
         catalog = Catalog.open(self.path, PASSWORD)
         self.assertTrue(catalog.editable)
-        tagged = catalog.set_tags(0, "Анна, 2024", PASSWORD)
-        tagged.add(Card("Квитанция", folder="03"), PASSWORD)
+        tagged = catalog.set_tags(0, "Анна, 2024")
+        tagged.add(Card("Квитанция", folder="03"))
         reopened = Catalog.open(self.path, PASSWORD)
-        self.assertEqual(reopened.cards[0], Card("Тестовый документ", tags="Анна, 2024", pdf=pdf))
+        self.assertEqual(reopened.cards[0], Card("Тестовый документ", tags="Анна, 2024", pdf=pdf, archive_number=1))
         self.assertEqual(reopened.cards[1].title, "Квитанция")
 
     def test_new_sample_archive_can_add_cards_and_edit_tags(self):
         sample = Card("Тестовый документ", pdf=sample_pdf())
         catalog = Catalog.create(self.path, PASSWORD, cards=(sample,))
         self.assertTrue(catalog.editable)
-        updated = catalog.add(Card("Квитанция", folder="03"), PASSWORD)
-        updated.set_tags(0, "Анна", PASSWORD)
+        updated = catalog.add(Card("Квитанция", folder="03"))
+        updated.set_tags(0, "Анна")
         reopened = Catalog.open(self.path, PASSWORD)
         self.assertEqual(reopened.cards[0].tags, "Анна")
         self.assertEqual(reopened.cards[0].pdf, sample.pdf)
@@ -94,7 +95,7 @@ class DocumentTest(unittest.TestCase):
         self.assertFalse(catalog.editable)
         self.assertEqual(catalog.cards[0].pdf, pdf)
         with self.assertRaisesRegex(ValueError, "с приватными правами"):
-            catalog.set_tags(0, "Анна", PASSWORD)
+            catalog.set_tags(0, "Анна")
         self.assertEqual(self.path.read_bytes(), original)
         self.assertEqual(stat.S_IMODE(self.path.stat().st_mode), 0o640)
 
@@ -106,11 +107,9 @@ class DocumentTest(unittest.TestCase):
         catalog = Catalog.create(self.path, PASSWORD)
         catalog = catalog.add(
             Card("Договор", tags="Анна, 2024, анна, Семейный архив", folder="01"),
-            PASSWORD,
         )
         catalog = catalog.add(
             Card("Квитанция", tags="Аннабель, 2024", folder="02"),
-            PASSWORD,
         )
         self.assertEqual(catalog.available_tags, ("2024", "Анна", "Аннабель", "Семейный архив"))
         self.assertEqual(catalog.cards[0].tags, "Анна, 2024, Семейный архив")
@@ -128,12 +127,11 @@ class DocumentTest(unittest.TestCase):
         pdf = sample_pdf()
         catalog = Catalog.create(self.path, PASSWORD).add(
             Card("Договор", number="07", tags="Старый тег", folder="01", pdf=pdf),
-            PASSWORD,
         )
         catalog = Catalog.open(self.path, PASSWORD)
-        updated = catalog.set_tags(0, "  Имя, 2024, ИМЯ,, ", PASSWORD)
+        updated = catalog.set_tags(0, "  Имя, 2024, ИМЯ,, ")
         with self.assertRaisesRegex(ValueError, "Архив изменился"):
-            catalog.set_tags(0, "Устаревшее изменение", PASSWORD)
+            catalog.set_tags(0, "Устаревшее изменение")
 
         backup = self.root / "backup.fvault"
         copy_verified(self.path, backup, PASSWORD)
@@ -141,10 +139,49 @@ class DocumentTest(unittest.TestCase):
         self.assertEqual(restored.cards, updated.cards)
         self.assertEqual(
             restored.cards[0],
-            Card("Договор", number="07", tags="Имя, 2024", folder="01", pdf=pdf),
+            Card("Договор", number="07", tags="Имя, 2024", folder="01", pdf=pdf, archive_number=1),
         )
-        restored.set_tags(0, "", PASSWORD)
+        restored.set_tags(0, "")
         self.assertEqual(Catalog.open(backup, PASSWORD).available_tags, ())
+
+    def test_previous_catalog_numbers_and_custom_types_survive_edit_and_backup(self):
+        old_card = asdict(Card("Старый договор", number="А-52", folder="03"))
+        old_card.pop("archive_number")
+        encrypted = encrypt(json.dumps([old_card]).encode(), PASSWORD, DOCUMENT_MAGIC)
+        self.path.write_bytes(encrypted)
+        self.path.chmod(0o600)
+
+        initial = Catalog.open(self.path, PASSWORD)
+        original, = initial.cards
+        self.assertEqual(original.archive_label, "0001")
+        self.assertTrue(original.matches("0001"))
+        self.assertTrue(original.matches("а-52"))
+        self.assertIn("Страховой полис", initial.available_kinds)
+
+        catalog = initial.update(0, Card("Договор", kind="Наследство", number="А-52", folder="03"))
+        first_save = self.path.read_bytes()
+        catalog = catalog.add(Card("Паспорт", kind="Паспорт", folder="04"))
+        self.assertIn("Наследство", catalog.available_kinds)
+        self.assertEqual([card.archive_number for card in catalog.cards], [1, 2])
+        self.assertEqual(catalog.cards[0].number, "А-52")
+
+        backup = self.root / "unlocked-backup.fvault"
+        catalog.backup(backup)
+        with self.assertRaises(FileExistsError):
+            catalog.backup(backup)
+        restored = Catalog.open(backup, PASSWORD)
+        self.assertEqual(restored.cards, catalog.cards)
+        self.assertEqual(restored.available_kinds, catalog.available_kinds)
+
+        nonce_offset = HEADER_SIZE - NONCE_SIZE
+        saved = self.path.read_bytes()
+        self.assertEqual(saved[:nonce_offset], encrypted[:nonce_offset])
+        self.assertEqual(
+            len({data[nonce_offset:HEADER_SIZE] for data in (encrypted, first_save, saved)}), 3
+        )
+        with self.assertRaisesRegex(ValueError, "Архив изменился"):
+            initial.backup(self.root / "stale.fvault")
+        self.assertFalse((self.root / "stale.fvault").exists())
 
 
 if __name__ == "__main__":

@@ -1,7 +1,7 @@
 """Authenticated storage for PDF and document archives."""
 
-from pathlib import Path
 import os
+from pathlib import Path
 
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives.kdf.scrypt import Scrypt
@@ -47,13 +47,40 @@ def create(path: Path, pdf: bytes, password: str) -> None:
 
 
 def encrypt(payload: bytes, password: str, magic: bytes) -> bytes:
-    if len(password) < 12:
-        raise ValueError("Для нового архива нужен пароль от 12 символов.")
-    salt = os.urandom(SALT_SIZE)
-    nonce = os.urandom(NONCE_SIZE)
-    header = magic + salt + nonce
-    cipher = AESGCM(_key(password, salt))
-    return header + cipher.encrypt(nonce, payload, header)
+    return UnlockedVault.create(password).encrypt(payload, magic)
+
+
+class UnlockedVault:
+    """Keep the derived cipher in memory while the archive is open."""
+
+    def __init__(self, password: str, salt: bytes) -> None:
+        self._salt = salt
+        self._cipher = AESGCM(_key(password, salt))
+
+    @classmethod
+    def create(cls, password: str) -> "UnlockedVault":
+        if len(password) < 12:
+            raise ValueError("Для нового архива нужен пароль от 12 символов.")
+        return cls(password, os.urandom(SALT_SIZE))
+
+    def encrypt(self, payload: bytes, magic: bytes) -> bytes:
+        nonce = os.urandom(NONCE_SIZE)
+        header = magic + self._salt + nonce
+        return header + self._cipher.encrypt(nonce, payload, header)
+
+    @classmethod
+    def open(cls, data: bytes, password: str) -> tuple["UnlockedVault", bytes, bytes]:
+        magic = data[:len(MAGIC)]
+        if magic not in (MAGIC, DOCUMENT_MAGIC) or not HEADER_SIZE + 16 <= len(data) <= MAX_CONTAINER:
+            raise ValueError("Неизвестный формат или поврежденный архив.")
+        header = data[:HEADER_SIZE]
+        salt = header[len(MAGIC):len(MAGIC) + SALT_SIZE]
+        nonce = header[-NONCE_SIZE:]
+        unlocked = cls(password, salt)
+        payload = unlocked._cipher.decrypt(nonce, data[HEADER_SIZE:], header)
+        if magic == MAGIC:
+            _check_pdf(payload)
+        return unlocked, magic, payload
 
 
 def read_container(path: Path) -> bytes:
@@ -62,15 +89,7 @@ def read_container(path: Path) -> bytes:
 
 
 def decrypt(data: bytes, password: str) -> tuple[bytes, bytes]:
-    magic = data[:len(MAGIC)]
-    if magic not in (MAGIC, DOCUMENT_MAGIC) or not HEADER_SIZE + 16 <= len(data) <= MAX_CONTAINER:
-        raise ValueError("Неизвестный формат или поврежденный архив.")
-    header = data[:HEADER_SIZE]
-    salt = header[len(MAGIC):len(MAGIC) + SALT_SIZE]
-    nonce = header[-NONCE_SIZE:]
-    payload = AESGCM(_key(password, salt)).decrypt(nonce, data[HEADER_SIZE:], header)
-    if magic == MAGIC:
-        _check_pdf(payload)
+    _, magic, payload = UnlockedVault.open(data, password)
     return magic, payload
 
 
