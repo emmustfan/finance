@@ -69,6 +69,50 @@ class DocumentTest(unittest.TestCase):
         self.assertTrue(catalog.legacy)
         self.assertEqual(catalog.cards[0].pdf, pdf)
 
+    def test_tags_filter_exactly_and_combine_with_search(self):
+        catalog = Catalog.create(self.path, PASSWORD)
+        catalog = catalog.add(
+            Card("Договор", tags="Анна, 2024, анна, Семейный архив", folder="01"),
+            PASSWORD,
+        )
+        catalog = catalog.add(
+            Card("Квитанция", tags="Аннабель, 2024", folder="02"),
+            PASSWORD,
+        )
+        self.assertEqual(catalog.available_tags, ("2024", "Анна", "Аннабель", "Семейный архив"))
+        self.assertEqual(catalog.cards[0].tags, "Анна, 2024, Семейный архив")
+        self.assertEqual(
+            [card.title for card in catalog.cards if card.matches("", tag="АННА")],
+            ["Договор"],
+        )
+        self.assertEqual(
+            [card.title for card in catalog.cards if card.matches("квит", tag="2024")],
+            ["Квитанция"],
+        )
+        self.assertTrue(catalog.cards[0].matches("", tag="семейный архив"))
+
+    def test_tags_can_be_changed_and_cleared_without_losing_other_fields(self):
+        pdf = sample_pdf()
+        catalog = Catalog.create(self.path, PASSWORD).add(
+            Card("Договор", number="07", tags="Старый тег", folder="01", pdf=pdf),
+            PASSWORD,
+        )
+        catalog = Catalog.open(self.path, PASSWORD)
+        updated = catalog.set_tags(0, "  Имя, 2024, ИМЯ,, ", PASSWORD)
+        with self.assertRaisesRegex(ValueError, "Архив изменился"):
+            catalog.set_tags(0, "Устаревшее изменение", PASSWORD)
+
+        backup = self.root / "backup.fvault"
+        copy_verified(self.path, backup, PASSWORD)
+        restored = Catalog.open(backup, PASSWORD)
+        self.assertEqual(restored.cards, updated.cards)
+        self.assertEqual(
+            restored.cards[0],
+            Card("Договор", number="07", tags="Имя, 2024", folder="01", pdf=pdf),
+        )
+        restored.set_tags(0, "", PASSWORD)
+        self.assertEqual(Catalog.open(backup, PASSWORD).available_tags, ())
+
 
 if __name__ == "__main__":
     unittest.main()

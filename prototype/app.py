@@ -7,7 +7,7 @@ import pypdfium2 as pdfium
 from cryptography.exceptions import InvalidTag
 from PIL import ImageTk
 
-from documents import CARD_FIELDS, Card, Catalog, read_pdf
+from documents import CARD_FIELDS, Card, Catalog, read_pdf, tag_names
 from sample import sample_pdf
 from vault import copy_verified, create
 
@@ -22,7 +22,7 @@ class ArchiveWindow:
         self.image = None
         self.page = 0
         self.catalog: Catalog | None = None
-        self.results: list[Card] = []
+        self.results: list[int] = []
 
         root.title("Семейный архив")
         toolbar = ttk.Frame(root, padding=8)
@@ -43,6 +43,16 @@ class ArchiveWindow:
         ttk.Label(sidebar, text="Поиск документов").pack(anchor="w")
         self.query = tk.StringVar()
         ttk.Entry(sidebar, textvariable=self.query, width=29).pack(fill="x", pady=(3, 8))
+        ttk.Label(sidebar, text="Фильтр по тегу").pack(anchor="w")
+        tag_row = ttk.Frame(sidebar)
+        tag_row.pack(fill="x", pady=(3, 8))
+        self.tag_filter = ttk.Combobox(tag_row, width=16, state="disabled")
+        self.tag_filter.pack(side="left", fill="x", expand=True)
+        self.tag_filter.bind("<<ComboboxSelected>>", lambda _: self.refresh_cards())
+        self.clear_tag_button = ttk.Button(
+            tag_row, text="Сбросить", command=self.clear_tag, state="disabled"
+        )
+        self.clear_tag_button.pack(side="left", padx=(4, 0))
         self.add_button = ttk.Button(
             sidebar, text="Добавить документ", command=self.add_card, state="disabled"
         )
@@ -56,6 +66,10 @@ class ArchiveWindow:
         detail.pack(side="left", fill="both", expand=True)
         self.details = ttk.Label(detail, wraplength=510, justify="left")
         self.details.pack(anchor="w")
+        self.edit_tags_button = ttk.Button(
+            detail, text="Изменить теги…", command=self.edit_tags, state="disabled"
+        )
+        self.edit_tags_button.pack(anchor="w", pady=(4, 0))
         controls = ttk.Frame(detail, padding=(0, 8))
         controls.pack(fill="x")
         ttk.Button(controls, text="←", command=lambda: self.move_page(-1)).pack(side="left")
@@ -131,20 +145,39 @@ class ArchiveWindow:
         self.catalog = catalog
         self.root.title(f"Семейный архив — {path.name}")
         self.add_button.configure(state="disabled" if catalog.legacy else "normal")
+        self.tag_filter.set("")
+        self.refresh_tags()
         if self.query.get():
             self.query.set("")
         else:
             self.refresh_cards()
 
-    def refresh_cards(self) -> None:
+    def refresh_tags(self) -> None:
+        active = self.tag_filter.get().casefold()
+        tags = self.catalog.available_tags
+        self.tag_filter.configure(values=tags, state="readonly" if tags else "disabled")
+        self.tag_filter.set(next((tag for tag in tags if tag.casefold() == active), ""))
+
+    def clear_tag(self) -> None:
+        self.tag_filter.set("")
+        self.refresh_cards()
+
+    def refresh_cards(self, preferred_index: int | None = None) -> None:
         cards = self.catalog.cards if self.catalog is not None else ()
-        self.results = [card for card in cards if card.matches(self.query.get())]
+        query, tag = self.query.get(), self.tag_filter.get()
+        self.clear_tag_button.configure(state="normal" if tag else "disabled")
+        self.results = [
+            index for index, card in enumerate(cards) if card.matches(query, tag=tag)
+        ]
         self.listbox.delete(0, "end")
-        for card in self.results:
+        for index in self.results:
+            card = cards[index]
             caption = f"{card.title} · {card.number}" if card.number else card.title
             self.listbox.insert("end", caption)
         if self.results:
-            self.listbox.selection_set(0)
+            row = self.results.index(preferred_index) if preferred_index in self.results else 0
+            self.listbox.selection_set(row)
+            self.listbox.see(row)
         self.select_card()
 
     def select_card(self, _event=None) -> None:
@@ -154,11 +187,14 @@ class ArchiveWindow:
         self.document = self.pdf = self.image = None
         self.preview.configure(image="")
         self.print_button.configure(state="disabled")
+        self.edit_tags_button.configure(state="disabled")
         self.details.configure(text="")
         self.status.configure(text="Документы не найдены" if self.catalog else "Откройте архив")
-        if not selected:
+        if not selected or self.catalog is None:
             return
-        card = self.results[selected[0]]
+        card = self.catalog.cards[self.results[selected[0]]]
+        if not self.catalog.legacy:
+            self.edit_tags_button.configure(state="normal")
         lines = [f"{label}: {getattr(card, key)}" for key, label in CARD_FIELDS[:8] if getattr(card, key)]
         if card.address:
             lines.append(f"Оригинал: {card.address}")
@@ -194,14 +230,37 @@ class ArchiveWindow:
         except (OSError, ValueError, InvalidTag) as exc:
             self.error(exc)
             return
-        if self.query.get():
+        self.refresh_tags()
+        index = len(self.catalog.cards) - 1
+        if not self.catalog.cards[index].matches(self.query.get(), tag=self.tag_filter.get()):
+            self.tag_filter.set("")
             self.query.set("")
-        else:
-            self.refresh_cards()
-        self.listbox.selection_clear(0, "end")
-        self.listbox.selection_set("end")
-        self.listbox.see("end")
-        self.select_card()
+        self.refresh_cards(index)
+
+    def edit_tags(self) -> None:
+        selected = self.listbox.curselection()
+        if not selected or self.catalog is None or self.catalog.legacy:
+            return
+        index = self.results[selected[0]]
+        current = self.catalog.cards[index].tags
+        value = simpledialog.askstring(
+            "Теги документа",
+            "Введите теги через запятую, например Анна, 2024.\n"
+            "Оставьте поле пустым, чтобы удалить все теги.",
+            initialvalue=current, parent=self.root,
+        )
+        if value is None or ", ".join(tag_names(value)) == current:
+            return
+        password = self.password("Введите пароль архива, чтобы сохранить теги")
+        if password is None:
+            return
+        try:
+            self.catalog = self.catalog.set_tags(index, value, password)
+        except (OSError, ValueError, InvalidTag) as exc:
+            self.error(exc)
+            return
+        self.refresh_tags()
+        self.refresh_cards(index)
 
     @staticmethod
     def render(document, index: int):
@@ -272,6 +331,8 @@ class CardDialog(simpledialog.Dialog):
         self.pdf = None
         self.inputs = {}
         for row, (key, label) in enumerate(CARD_FIELDS):
+            if key == "tags":
+                label = "Теги через запятую"
             ttk.Label(master, text=label).grid(row=row, column=0, sticky="w", padx=6, pady=2)
             entry = ttk.Entry(master, width=40)
             entry.grid(row=row, column=1, sticky="ew", padx=6, pady=2)

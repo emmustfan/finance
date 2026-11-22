@@ -7,7 +7,7 @@ import json
 import os
 import stat
 import tempfile
-from dataclasses import asdict, dataclass, fields
+from dataclasses import asdict, dataclass, fields, replace
 from pathlib import Path
 
 from vault import (
@@ -18,9 +18,20 @@ from vault import (
 CARD_FIELDS = (
     ("title", "Название"), ("kind", "Тип"), ("number", "Номер"),
     ("date", "Дата"), ("expires", "Срок действия"), ("party", "Человек или организация"),
-    ("tags", "Метки"), ("note", "Примечание"), ("cabinet", "Шкаф или место хранения"),
+    ("tags", "Теги"), ("note", "Примечание"), ("cabinet", "Шкаф или место хранения"),
     ("folder", "Папка"), ("section", "Раздел"), ("position", "Номер в папке"),
 )
+
+
+def tag_names(value: str) -> tuple[str, ...]:
+    if not isinstance(value, str):
+        raise ValueError("Теги должны быть текстом.")
+    names = {}
+    for part in value.split(","):
+        name = part.strip()
+        if name:
+            names.setdefault(name.casefold(), name)
+    return tuple(names.values())
 
 
 @dataclass(frozen=True)
@@ -49,7 +60,10 @@ class Card:
         if self.pdf is not None:
             _check_pdf(self.pdf)
 
-    def matches(self, query: str) -> bool:
+    def matches(self, query: str, *, tag: str = "") -> bool:
+        tag = tag.casefold()
+        if tag and not any(name.casefold() == tag for name in tag_names(self.tags)):
+            return False
         searchable = " ".join(
             (self.title, self.number, self.party, self.kind, self.tags, self.folder)
         ).casefold()
@@ -127,9 +141,27 @@ class Catalog:
         return cls(path, (), hashlib.sha256(data).digest())
 
     def add(self, card: Card, password: str) -> "Catalog":
+        card = replace(card, tags=", ".join(tag_names(card.tags)))
+        return self._save((*self.cards, card), password)
+
+    @property
+    def available_tags(self) -> tuple[str, ...]:
+        names = {}
+        for card in self.cards:
+            for name in tag_names(card.tags):
+                names.setdefault(name.casefold(), name)
+        return tuple(names[key] for key in sorted(names))
+
+    def set_tags(self, index: int, value: str, password: str) -> "Catalog":
+        if not 0 <= index < len(self.cards):
+            raise ValueError("Документ не найден.")
+        card = replace(self.cards[index], tags=", ".join(tag_names(value)))
+        cards = (*self.cards[:index], card, *self.cards[index + 1:])
+        return self._save(cards, password)
+
+    def _save(self, cards: tuple[Card, ...], password: str) -> "Catalog":
         if self.legacy:
-            raise ValueError("Создайте новый архив документов для добавления карточек.")
-        cards = (*self.cards, card)
+            raise ValueError("Создайте новый архив документов, чтобы сохранять изменения.")
         payload = _encode_cards(cards)
         lock_path = self.path.with_name(f".{self.path.name}.lock")
         fd = os.open(lock_path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
@@ -140,7 +172,7 @@ class Catalog:
                 raise ValueError("Для изменения нужен архив владельца с приватными правами доступа.")
             existing = read_container(self.path)
             if hashlib.sha256(existing).digest() != self.revision:
-                raise ValueError("Архив изменился. Откройте его заново и повторите добавление.")
+                raise ValueError("Архив изменился. Откройте его заново и повторите изменение.")
             decrypt(existing, password)
             data = encrypt(payload, password, DOCUMENT_MAGIC)
             with tempfile.NamedTemporaryFile(dir=self.path.parent, delete=False) as stream:
