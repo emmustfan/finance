@@ -74,7 +74,7 @@ QComboBox::down-arrow { width: 9px; height: 9px; }
 QListWidget { background: transparent; border: 0; outline: 0; padding: 1px; }
 QListWidget::item { border: 1px solid transparent; border-radius: 11px; }
 QListWidget::item:hover { background: #F1F5FA; }
-QListWidget::item:selected { background: #E7F4EF; border: 1px solid #C6E4D9; }
+QListWidget::item:selected { color: #1A2737; background: #E7F4EF; border: 1px solid #C6E4D9; }
 QDialog { background: white; }
 QMenu { color: #1A2737; background: white; border: 1px solid #DBE3EC; padding: 4px; }
 QMenu::item { padding: 8px 16px; }

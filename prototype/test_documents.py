@@ -6,8 +6,9 @@ import unittest
 from pathlib import Path
 
 from cryptography.exceptions import InvalidTag
+from PIL import Image
 
-from documents import Card, Catalog, read_pdf
+from documents import Card, Catalog, read_pdf, read_photo
 from sample import sample_pdf
 from vault import DOCUMENT_MAGIC, HEADER_SIZE, NONCE_SIZE, copy_verified, create, encrypt
 
@@ -182,6 +183,52 @@ class DocumentTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "Архив изменился"):
             initial.backup(self.root / "stale.fvault")
         self.assertFalse((self.root / "stale.fvault").exists())
+
+    def test_photos_and_pdf_are_restored_without_source_files(self):
+        png = self.root / "front.png"
+        jpg = self.root / "back.jpg"
+        Image.new("RGBA", (80, 40), "blue").save(png)
+        Image.new("RGB", (40, 80), "red").save(jpg)
+        photos = (read_photo(png), read_photo(jpg))
+        sample = sample_pdf()
+        catalog = Catalog.create(self.path, PASSWORD, cards=(
+            Card("Фото оригинала", photos=photos),
+            Card("Копия и фотографии", pdf=sample, photos=photos),
+        ))
+        self.assertNotIn(b"front.png", self.path.read_bytes())
+        copy = self.root / "backup.fvault"
+        catalog.backup(copy)
+        png.unlink()
+        jpg.unlink()
+        self.path.unlink()
+        copy_verified(copy, self.path, PASSWORD)
+        restored = Catalog.open(self.path, PASSWORD)
+        self.assertEqual(restored.cards[0].photos, photos)
+        self.assertEqual(restored.cards[1].pdf, sample)
+        self.assertEqual(restored.cards[1].photos, photos)
+        self.assertEqual(restored.cards[0].photos[1].render((30, 30)).size, (15, 30))
+
+    def test_photo_requires_a_supported_image(self):
+        path = self.root / "invalid.png"
+        path.write_bytes(sample_pdf())
+        with self.assertRaisesRegex(ValueError, "Выберите JPEG или PNG"):
+            read_photo(path)
+
+    def test_paper_inventory_groups_location_and_sorts_section_and_position(self):
+        catalog = Catalog.create(self.path, PASSWORD, cards=(
+            Card("Договор", cabinet="Шкаф", folder="03", section="10"),
+            Card("Страховка", cabinet="Шкаф", folder="03", section="2", position="11"),
+            Card("Паспорт", cabinet="шкаф", folder="03", section="2", position="2"),
+            Card("Другая папка", cabinet="Ящик", folder="03"),
+            Card("Без папки", cabinet="Полка"),
+        ))
+        inventory = catalog.folder_inventory()
+        self.assertEqual(list(inventory), [("Шкаф", "03"), ("Ящик", "03")])
+        self.assertEqual(
+            [card.title for card in inventory[("Шкаф", "03")]],
+            ["Паспорт", "Страховка", "Договор"],
+        )
+        self.assertEqual([card.title for card in inventory[("Ящик", "03")]], ["Другая папка"])
 
 
 if __name__ == "__main__":

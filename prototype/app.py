@@ -2,21 +2,27 @@
 
 import subprocess
 import sys
+from html import escape
+from io import BytesIO
 from pathlib import Path
 
 import pypdfium2 as pdfium
 from cryptography.exceptions import InvalidTag
 from PySide6.QtCore import QSize, Qt, QTimer
-from PySide6.QtGui import QAction, QKeySequence, QPixmap, QShortcut
+from PySide6.QtGui import QAction, QKeySequence, QPixmap, QShortcut, QTextDocument
+from PySide6.QtPrintSupport import QPrintDialog, QPrinter
 from PySide6.QtWidgets import (
-    QApplication, QComboBox, QDialog, QFileDialog, QFrame, QHBoxLayout, QInputDialog,
+    QAbstractItemView, QApplication, QComboBox, QDialog, QFileDialog, QFrame,
+    QHBoxLayout, QHeaderView, QInputDialog,
     QLabel, QLineEdit, QListWidget, QListWidgetItem, QMainWindow, QMenu, QMessageBox,
-    QPushButton, QScrollArea, QSizePolicy, QSplitter, QToolButton, QVBoxLayout, QWidget,
+    QPushButton, QScrollArea, QSizePolicy, QSplitter, QTableWidget, QTableWidgetItem,
+    QToolButton, QVBoxLayout, QWidget,
 )
 from PIL.ImageQt import ImageQt
+from PIL import Image
 
 from appearance import TagEditor, TagFlow, apply_style, clear_tags, tag_button
-from documents import CARD_FIELDS, Card, Catalog, read_pdf, tag_names
+from documents import CARD_FIELDS, MAX_ATTACHMENT_BYTES, Card, Catalog, Photo, read_pdf, read_photo, tag_names
 from sample import sample_pdf
 from vault import copy_verified
 
@@ -55,13 +61,15 @@ def area(widget) -> QScrollArea:
     return view
 
 
-class PdfPreview(QFrame):
+class AttachmentPreview(QFrame):
     def __init__(self, report_error, parent=None):
         super().__init__(parent)
         self.setObjectName("preview")
         self.report_error = report_error
         self.document = None
         self.data = None
+        self.photo: Photo | None = None
+        self.attachments: tuple[bytes | Photo, ...] = ()
         self.page = 0
         self.fit_timer = QTimer(self)
         self.fit_timer.setSingleShot(True)
@@ -70,7 +78,14 @@ class PdfPreview(QFrame):
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(12, 12, 12, 12)
-        self.image = label("Выберите документ с PDF", "muted")
+        self.chooser = ChoiceBox()
+        self.chooser.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+        self.chooser.setMinimumContentsLength(12)
+        self.chooser.setAccessibleName("Выбрать вложение")
+        self.chooser.toggle.setAccessibleName("Открыть список вложений")
+        self.chooser.currentIndexChanged.connect(self.show_attachment)
+        layout.addWidget(self.chooser)
+        self.image = label("Выберите документ с вложением", "muted")
         self.image.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.image.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Ignored)
         self.image.setMinimumHeight(130)
@@ -83,26 +98,47 @@ class PdfPreview(QFrame):
         self.next.setAccessibleName("Следующая страница")
         self.next.setToolTip(self.next.accessibleName())
         self.page_label = label(style="muted")
-        self.print_button = button("Печать PDF", self.print_pdf)
+        self.print_button = button("Печать", self.print_attachment)
         controls.addWidget(self.previous)
         controls.addWidget(self.next)
         controls.addWidget(self.page_label)
         controls.addStretch(1)
         controls.addWidget(self.print_button)
         layout.addLayout(controls)
-        self.set_pdf(None, "Выберите документ с PDF")
+        self.set_card(None)
 
-    def set_pdf(self, data: bytes | None, empty="К карточке не прикреплён PDF") -> None:
+    def set_card(self, card: Card | None) -> None:
+        pdf = card.pdf if card is not None else None
+        photos = card.photos if card is not None else ()
+        self.attachments = ((pdf,) if pdf is not None else ()) + photos
+        self.chooser.blockSignals(True)
+        self.chooser.clear()
+        for attachment in self.attachments:
+            self.chooser.addItem(attachment.name if isinstance(attachment, Photo) else "PDF")
+        self.chooser.blockSignals(False)
+        self.chooser.setVisible(len(self.attachments) > 1)
+        self.show_attachment(0)
+        if card is None:
+            self.image.setText("Выберите документ с вложением")
+
+    def show_attachment(self, index: int) -> None:
         self.fit_timer.stop()
         if self.document is not None:
             self.document.close()
         self.document = None
         self.data = None
+        self.photo = None
         self.page = 0
-        self.image.setText(empty)
-        if data is not None:
+        self.image.setText("У карточки нет вложений")
+        if 0 <= index < len(self.attachments):
+            attachment = self.attachments[index]
+            if isinstance(attachment, Photo):
+                self.photo = attachment
+                self.fit_timer.start()
+                self.update_controls()
+                return
             try:
-                doc = pdfium.PdfDocument(data)
+                doc = pdfium.PdfDocument(attachment)
                 if not len(doc):
                     doc.close()
                     raise ValueError("В PDF нет страниц.")
@@ -110,21 +146,24 @@ class PdfPreview(QFrame):
                 self.image.setText("Не удалось открыть PDF")
                 self.report_error(exc)
             else:
-                self.document, self.data = doc, data
+                self.document, self.data = doc, attachment
                 self.fit_timer.start()
         self.update_controls()
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
-        if self.document is not None:
+        if self.document is not None or self.photo is not None:
             self.fit_timer.start()
 
     def update_controls(self) -> None:
         count = len(self.document) if self.document is not None else 0
         self.previous.setEnabled(self.page > 0)
         self.next.setEnabled(self.page + 1 < count)
-        self.print_button.setEnabled(count > 0)
-        self.page_label.setText(f"{self.page + 1} / {count}" if count else "Предпросмотр PDF")
+        self.print_button.setEnabled(count > 0 or self.photo is not None)
+        if self.photo is not None:
+            self.page_label.setText("Фотография")
+        else:
+            self.page_label.setText(f"{self.page + 1} / {count}" if count else "Предпросмотр")
 
     def move(self, delta: int) -> None:
         if self.document is not None and 0 <= self.page + delta < len(self.document):
@@ -133,6 +172,20 @@ class PdfPreview(QFrame):
             self.update_controls()
 
     def render(self) -> None:
+        ratio = self.devicePixelRatioF()
+        space = (
+            min(1600, max(1, round((self.image.width() - 8) * ratio))),
+            min(1600, max(1, round((self.image.height() - 8) * ratio))),
+        )
+        if self.photo is not None:
+            try:
+                pixmap = QPixmap.fromImage(ImageQt(self.photo.render(space)))
+                pixmap.setDevicePixelRatio(ratio)
+                self.image.setPixmap(pixmap)
+            except (OSError, ValueError) as exc:
+                self.image.setText("Не удалось отобразить фотографию")
+                self.report_error(exc)
+            return
         if self.document is None:
             return
         try:
@@ -141,12 +194,7 @@ class PdfPreview(QFrame):
                 width, height = page.get_size()
                 if width <= 0 or height <= 0:
                     raise ValueError("У страницы PDF некорректный размер.")
-                ratio = self.devicePixelRatioF()
-                scale = min(
-                    max(1, self.image.width() - 8) * ratio / width,
-                    max(1, self.image.height() - 8) * ratio / height,
-                    1600 / max(width, height),
-                )
+                scale = min(space[0] / width, space[1] / height)
                 bitmap = page.render(scale=scale)
                 try:
                     pixmap = QPixmap.fromImage(ImageQt(bitmap.to_pil()))
@@ -160,36 +208,42 @@ class PdfPreview(QFrame):
             self.image.setText("Не удалось отобразить страницу")
             self.page_label.setText(str(exc))
 
-    def print_pdf(self) -> None:
-        if self.data is None:
+    def print_attachment(self) -> None:
+        if self.data is None and self.photo is None:
             return
         reply = QMessageBox.question(
-            self, "Печать PDF", "Отправить PDF на принтер по умолчанию?",
+            self, "Печать вложения", "Отправить вложение на принтер по умолчанию?",
             QMessageBox.StandardButton.Ok | QMessageBox.StandardButton.Cancel,
         )
         if reply != QMessageBox.StandardButton.Ok:
             return
         try:
+            data = self.data
+            command = ["/usr/bin/lp", "-t", "Family archive document"]
+            if self.photo is not None:
+                photo = self.photo.render((1454, 2139))
+                page = Image.new("RGB", (1654, 2339), "white")
+                offset = ((page.width - photo.width) // 2, (page.height - photo.height) // 2)
+                page.paste(photo, offset, mask=photo.getchannel("A"))
+                stream = BytesIO()
+                page.save(stream, format="PDF", resolution=200)
+                data = stream.getvalue()
+                command.extend(("-o", "fit-to-page"))
             result = subprocess.run(
-                ["/usr/bin/lp", "-t", "Family archive PDF", "-"],
-                input=self.data, capture_output=True, timeout=30, check=False,
+                [*command, "-"],
+                input=data, capture_output=True, timeout=30, check=False,
             )
             if result.returncode:
                 raise RuntimeError(result.stderr.decode(errors="replace").strip() or "Ошибка CUPS.")
-        except (OSError, RuntimeError, subprocess.TimeoutExpired) as exc:
+        except (OSError, ValueError, RuntimeError, subprocess.TimeoutExpired) as exc:
             self.report_error(exc)
             return
         QMessageBox.information(self, "Печать", "Задание передано в очередь печати.")
 
 
-class DocumentTypeBox(QComboBox):
-    def __init__(self, kinds: tuple[str, ...], value: str):
+class ChoiceBox(QComboBox):
+    def __init__(self):
         super().__init__()
-        self.setEditable(True)
-        self.addItem("")
-        self.addItems(kinds)
-        self.setCurrentText(value)
-        self.lineEdit().setPlaceholderText("Выберите или впишите свой тип")
         self.toggle = QToolButton(self)
         self.toggle.setObjectName("typeToggle")
         self.toggle.setText("▾")
@@ -202,12 +256,25 @@ class DocumentTypeBox(QComboBox):
         self.toggle.setGeometry(self.width() - 29, (self.height() - 26) // 2, 25, 26)
 
 
+class DocumentTypeBox(ChoiceBox):
+    def __init__(self, kinds: tuple[str, ...], value: str):
+        super().__init__()
+        self.setEditable(True)
+        self.addItem("")
+        self.addItems(kinds)
+        self.setCurrentText(value)
+        self.lineEdit().setPlaceholderText("Выберите или впишите свой тип")
+        self.toggle.raise_()
+
+
 class CardDialog(QDialog):
     def __init__(self, parent, kinds: tuple[str, ...], card: Card | None):
         super().__init__(parent)
         self.setWindowTitle("Изменить карточку" if card is not None else "Новый документ")
         self.resize(710, 600)
         self.pdf = card.pdf if card is not None else None
+        self.pdf_name = "PDF"
+        self.photos = card.photos if card is not None else ()
         self.card: Card | None = None
         self.inputs: dict[str, QLineEdit | QComboBox] = {}
 
@@ -215,7 +282,9 @@ class CardDialog(QDialog):
         main.setContentsMargins(24, 20, 24, 20)
         main.setSpacing(12)
         main.addWidget(label(self.windowTitle(), "screenTitle"))
-        main.addWidget(label("Укажите название и приложите PDF или запишите, где лежит оригинал.", "muted", wrap=True))
+        main.addWidget(label(
+            "Укажите название и добавьте вложение или адрес оригинала.", "muted", wrap=True
+        ))
 
         form = QWidget()
         form.setObjectName("formContent")
@@ -242,15 +311,24 @@ class CardDialog(QDialog):
         original.addWidget(label("Теги", "sectionTitle"))
         self.tag_editor = TagEditor(card.tags if card is not None else "")
         original.addWidget(self.tag_editor)
-        self.attachment = label(
-            "PDF прикреплён" if self.pdf is not None else "PDF не выбран", "muted", wrap=True
-        )
         original.addSpacing(3)
-        original.addWidget(label("Вложение", "sectionTitle"))
+        original.addWidget(label("Вложения", "sectionTitle"))
         attachment = QHBoxLayout()
-        attachment.addWidget(button("Выбрать PDF…", self.choose_pdf))
-        attachment.addWidget(self.attachment, 1)
+        attachment.addWidget(button("+ PDF", self.choose_pdf))
+        attachment.addWidget(button("+ Фото", self.choose_photos))
+        attachment.addStretch(1)
         original.addLayout(attachment)
+        self.attachment_list = QListWidget()
+        self.attachment_list.setAccessibleName("Вложения карточки")
+        self.attachment_list.setMaximumHeight(78)
+        self.attachment_list.setTextElideMode(Qt.TextElideMode.ElideMiddle)
+        original.addWidget(self.attachment_list)
+        self.remove_attachment_button = button("Убрать выбранное", self.remove_attachment)
+        original.addWidget(self.remove_attachment_button, alignment=Qt.AlignmentFlag.AlignLeft)
+        self.attachment_list.currentRowChanged.connect(
+            lambda row: self.remove_attachment_button.setEnabled(row >= 0)
+        )
+        self.refresh_attachments()
         original.addSpacing(3)
         original.addWidget(label("Бумажный оригинал", "sectionTitle"))
         for key in ("cabinet", "folder"):
@@ -300,14 +378,59 @@ class CardDialog(QDialog):
             QMessageBox.warning(self, "Не удалось приложить PDF", str(exc))
             return
         self.pdf = data
-        self.attachment.setText(path.name)
+        self.pdf_name = path.name
+        self.refresh_attachments()
+
+    def choose_photos(self) -> None:
+        filenames, _ = QFileDialog.getOpenFileNames(
+            self, "Выберите фотографии", "", "Фотографии (*.jpg *.jpeg *.png)"
+        )
+        if not filenames:
+            return
+        photos = []
+        total = len(self.pdf or b"") + sum(len(photo.data) for photo in self.photos)
+        for filename in filenames:
+            path = Path(filename)
+            try:
+                photo = read_photo(path)
+                total += len(photo.data)
+                if total > MAX_ATTACHMENT_BYTES:
+                    raise ValueError("Вложения превышают доступный размер архива.")
+                photos.append(photo)
+            except (OSError, ValueError) as exc:
+                QMessageBox.warning(self, "Не удалось добавить фото", f"{path.name}\n{exc}")
+                return
+        self.photos = (*self.photos, *photos)
+        self.refresh_attachments()
+
+    def refresh_attachments(self) -> None:
+        self.attachment_list.clear()
+        if self.pdf is not None:
+            self.attachment_list.addItem(self.pdf_name)
+        self.attachment_list.addItems([photo.name for photo in self.photos])
+        has_attachments = bool(self.attachment_list.count())
+        self.attachment_list.setVisible(has_attachments)
+        self.remove_attachment_button.setVisible(has_attachments)
+        if has_attachments:
+            self.attachment_list.setCurrentRow(0)
+
+    def remove_attachment(self) -> None:
+        row = self.attachment_list.currentRow()
+        if row < 0:
+            return
+        if row == 0 and self.pdf is not None:
+            self.pdf = None
+        else:
+            index = row - (1 if self.pdf is not None else 0)
+            self.photos = (*self.photos[:index], *self.photos[index + 1:])
+        self.refresh_attachments()
 
     def save(self) -> None:
         values = {
             key: (widget.currentText() if isinstance(widget, QComboBox) else widget.text()).strip()
             for key, widget in self.inputs.items()
         }
-        card = Card(**values, tags=self.tag_editor.value(), pdf=self.pdf)
+        card = Card(**values, tags=self.tag_editor.value(), pdf=self.pdf, photos=self.photos)
         try:
             card.validate()
         except ValueError as exc:
@@ -368,6 +491,108 @@ class DocumentRow(QWidget):
         if event.button() == Qt.MouseButton.LeftButton:
             self.select()
         super().mousePressEvent(event)
+
+
+INVENTORY_COLUMNS = ("№ карточки", "Документ", "Раздел", "Номер в папке")
+
+
+def inventory_values(card: Card) -> tuple[str, ...]:
+    document = f"{card.title}\n№ {card.number}" if card.number else card.title
+    return card.archive_label, document, card.section, card.position
+
+
+class FolderDialog(QDialog):
+    def __init__(self, parent, catalog: Catalog):
+        super().__init__(parent)
+        self.setWindowTitle("Бумажные папки")
+        self.resize(830, 505)
+        self.folders = catalog.folder_inventory()
+        self.location: tuple[str, str] | None = None
+        self.archive_number: int | None = None
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(22, 18, 22, 18)
+        layout.addWidget(label("Бумажные папки", "screenTitle"))
+        content = QHBoxLayout()
+        self.folder_list = QListWidget()
+        self.folder_list.setAccessibleName("Папки в архиве")
+        self.folder_list.setFixedWidth(220)
+        content.addWidget(self.folder_list)
+        for cabinet, folder in self.folders:
+            item = QListWidgetItem(f"{folder} · {cabinet}" if cabinet else folder)
+            item.setToolTip(item.text())
+            self.folder_list.addItem(item)
+        self.folder_list.currentRowChanged.connect(self.select_folder)
+        right = QVBoxLayout()
+        content.addLayout(right, 1)
+        self.heading = label(style="sectionTitle", wrap=True)
+        right.addWidget(self.heading)
+        self.inventory = QTableWidget(0, len(INVENTORY_COLUMNS))
+        self.inventory.setAccessibleName("Опись папки")
+        self.inventory.setHorizontalHeaderLabels(INVENTORY_COLUMNS)
+        self.inventory.verticalHeader().hide()
+        self.inventory.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.inventory.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.inventory.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.inventory.setAlternatingRowColors(True)
+        header = self.inventory.horizontalHeader()
+        header.setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        self.inventory.cellDoubleClicked.connect(lambda row, _: self.open_card(row))
+        right.addWidget(self.inventory, 1)
+        layout.addLayout(content, 1)
+        actions = QHBoxLayout()
+        actions.addStretch(1)
+        actions.addWidget(button("Закрыть", self.reject))
+        self.print_button = button("Распечатать опись…", self.print_inventory, primary=True)
+        actions.addWidget(self.print_button)
+        layout.addLayout(actions)
+        if self.folders:
+            self.folder_list.setCurrentRow(0)
+        else:
+            self.heading.setText("Укажите папку в карточке документа, чтобы составить опись.")
+            self.print_button.setEnabled(False)
+
+    def select_folder(self, row: int) -> None:
+        if row < 0:
+            return
+        self.location = tuple(self.folders)[row]
+        cards = self.folders[self.location]
+        self.heading.setText(" → ".join(filter(None, self.location)))
+        self.inventory.setRowCount(len(cards))
+        for row, card in enumerate(cards):
+            for column, value in enumerate(inventory_values(card)):
+                self.inventory.setItem(row, column, QTableWidgetItem(value))
+        self.inventory.resizeRowsToContents()
+
+    def open_card(self, row: int) -> None:
+        if self.location is not None:
+            self.archive_number = self.folders[self.location][row].archive_number
+            self.accept()
+
+    def printable_inventory(self) -> QTextDocument:
+        document = QTextDocument()
+        columns = "".join(f"<th>{escape(column)}</th>" for column in INVENTORY_COLUMNS)
+        rows = []
+        for card in self.folders[self.location]:
+            cells = "".join(
+                f"<td>{escape(value).replace(chr(10), '<br>')}</td>" for value in inventory_values(card)
+            )
+            rows.append(f"<tr>{cells}</tr>")
+        location = escape(self.heading.text())
+        document.setHtml(
+            f"<h1>Опись папки</h1><p>{location}</p>"
+            f'<table border="1" cellspacing="0" cellpadding="7" width="100%">'
+            f"<thead><tr>{columns}</tr></thead>{''.join(rows)}</table>"
+        )
+        return document
+
+    def print_inventory(self) -> None:
+        if self.location is None:
+            return
+        printer = QPrinter(QPrinter.PrinterMode.HighResolution)
+        printer.setDocName("Опись бумажной папки")
+        if QPrintDialog(printer, self).exec() == QDialog.DialogCode.Accepted:
+            self.printable_inventory().print_(printer)
 
 
 class ArchiveWindow(QMainWindow):
@@ -431,6 +656,8 @@ class ArchiveWindow(QMainWindow):
         layout.addWidget(self.archive_hint)
         layout.addWidget(button("Открыть архив…", self.open_archive, sidebar=True))
         layout.addWidget(button("Новый архив…", lambda: self.create_archive(False), sidebar=True))
+        self.folders_button = button("Бумажные папки…", self.open_folders, sidebar=True)
+        layout.addWidget(self.folders_button)
         layout.addSpacing(12)
         layout.addWidget(label("ТЕГИ", "sideSection"))
         self.all_documents = button("Все документы", lambda: self.set_tag(""), sidebar=True)
@@ -527,7 +754,7 @@ class ArchiveWindow(QMainWindow):
         self.metadata.setMaximumHeight(120)
         self.metadata.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Maximum)
         layout.addWidget(self.metadata)
-        self.preview = PdfPreview(self.error)
+        self.preview = AttachmentPreview(self.error)
         layout.addWidget(self.preview, 1)
         return panel
 
@@ -606,12 +833,29 @@ class ArchiveWindow(QMainWindow):
         self.archive_hint.setVisible(bool(self.archive_hint.text()))
         self.close_action.setEnabled(catalog is not None)
         self.search.setEnabled(catalog is not None)
+        self.folders_button.setEnabled(catalog is not None)
         self.add_button.setEnabled(catalog is not None and catalog.editable)
         self.search.blockSignals(True)
         self.search.clear()
         self.search.blockSignals(False)
         self.refresh_sidebar_tags()
         self.refresh_list(0)
+
+    def open_folders(self) -> None:
+        if self.catalog is None:
+            return
+        dialog = FolderDialog(self, self.catalog)
+        if dialog.exec() != QDialog.DialogCode.Accepted or dialog.archive_number is None:
+            return
+        index = next(
+            idx for idx, card in enumerate(self.catalog.cards) if card.archive_number == dialog.archive_number
+        )
+        self.active_tag = ""
+        self.search.blockSignals(True)
+        self.search.clear()
+        self.search.blockSignals(False)
+        self.refresh_sidebar_tags()
+        self.refresh_list(index)
 
     def refresh_sidebar_tags(self) -> None:
         tags = self.catalog.available_tags if self.catalog is not None else ()
@@ -693,7 +937,7 @@ class ArchiveWindow(QMainWindow):
             self.card_title.setText("Откройте архив" if self.catalog is None else "Документ")
             self.details.clear()
             self.metadata.hide()
-            self.preview.set_pdf(None, "Выберите документ с PDF")
+            self.preview.set_card(None)
             return
         self.number.setText(f"№ {card.archive_label}")
         self.card_title.setText(card.title)
@@ -715,7 +959,7 @@ class ArchiveWindow(QMainWindow):
             lines.append(f"Оригинал: {card.address}")
         self.details.setText("\n".join(lines))
         self.metadata.setVisible(bool(lines))
-        self.preview.set_pdf(card.pdf)
+        self.preview.set_card(card)
 
     def save_card(self, *, edit: bool = False) -> None:
         if self.catalog is None or not self.catalog.editable:

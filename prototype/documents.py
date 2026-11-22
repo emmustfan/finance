@@ -5,10 +5,14 @@ import fcntl
 import hashlib
 import json
 import os
+import re
 import stat
 import tempfile
 from dataclasses import asdict, dataclass, field, fields, replace
+from io import BytesIO
 from pathlib import Path
+
+from PIL import Image, ImageOps
 
 from vault import (
     DOCUMENT_MAGIC, MAGIC, MAX_DOCUMENT_DATA, MAX_PDF, UnlockedVault, _check_pdf,
@@ -27,6 +31,45 @@ DEFAULT_KINDS = (
     "Страховой полис", "Договор", "Квитанция", "Справка", "Выписка",
     "Доверенность", "Медицинский документ", "Документ на имущество",
 )
+
+MAX_PHOTO = 12 * 1024 * 1024
+MAX_PHOTO_PIXELS = 50_000_000
+MAX_ATTACHMENT_BYTES = MAX_DOCUMENT_DATA * 3 // 4
+
+
+@dataclass(frozen=True)
+class Photo:
+    name: str
+    data: bytes = field(repr=False)
+
+    def validate(self, *, verify=False) -> None:
+        if not isinstance(self.name, str) or not self.name.strip():
+            raise ValueError("У фотографии должно быть имя файла.")
+        if not isinstance(self.data, bytes) or len(self.data) > MAX_PHOTO:
+            raise ValueError("Размер фотографии должен быть не больше 12 МиБ.")
+        try:
+            with Image.open(BytesIO(self.data), formats=["JPEG", "PNG"]) as image:
+                if image.width * image.height > MAX_PHOTO_PIXELS:
+                    raise ValueError("Размер фотографии должен быть не больше 50 мегапикселей.")
+                if verify:
+                    image.verify()
+        except (OSError, SyntaxError, Image.DecompressionBombError) as exc:
+            raise ValueError("Не удалось прочитать фотографию. Выберите JPEG или PNG.") from exc
+
+    def render(self, size: tuple[int, int]) -> Image.Image:
+        with Image.open(BytesIO(self.data), formats=["JPEG", "PNG"]) as image:
+            image.draft(None, (max(size), max(size)))
+            image.thumbnail((max(size), max(size)))
+            oriented = ImageOps.exif_transpose(image)
+            oriented.thumbnail(size)
+            return oriented.convert("RGBA")
+
+
+def read_photo(path: Path) -> Photo:
+    with path.open("rb") as stream:
+        photo = Photo(path.name, stream.read(MAX_PHOTO + 1))
+    photo.validate(verify=True)
+    return photo
 
 
 def tag_names(value: str) -> tuple[str, ...]:
@@ -56,6 +99,7 @@ class Card:
     position: str = ""
     pdf: bytes | None = None
     archive_number: int = 0
+    photos: tuple[Photo, ...] = ()
 
     @property
     def archive_label(self) -> str:
@@ -66,10 +110,12 @@ class Card:
             raise ValueError("Некорректные поля документа.")
         if not self.title.strip():
             raise ValueError("Введите название документа.")
-        if self.pdf is None and not (self.cabinet.strip() or self.folder.strip()):
-            raise ValueError("Приложите PDF или укажите место хранения оригинала.")
+        if self.pdf is None and not self.photos and not (self.cabinet.strip() or self.folder.strip()):
+            raise ValueError("Приложите PDF или фотографию либо укажите место хранения оригинала.")
         if self.pdf is not None:
             _check_pdf(self.pdf)
+        for photo in self.photos:
+            photo.validate()
 
     def matches(self, query: str, *, tag: str = "") -> bool:
         tag = tag.casefold()
@@ -94,12 +140,24 @@ def read_pdf(path: Path) -> bytes:
 
 
 def _encode_cards(cards: tuple[Card, ...]) -> bytes:
+    attachment_bytes = sum(
+        len(card.pdf or b"") + sum(len(photo.data) for photo in card.photos) for card in cards
+    )
+    if attachment_bytes > MAX_ATTACHMENT_BYTES:
+        raise ValueError("Архив превысил лимит 64 МиБ. Создайте отдельный архив.")
     items = []
     for card in cards:
         card.validate()
         item = asdict(card)
         if card.pdf is not None:
             item["pdf"] = base64.b64encode(card.pdf).decode("ascii")
+        if card.photos:
+            item["photos"] = [
+                {"name": photo.name, "data": base64.b64encode(photo.data).decode("ascii")}
+                for photo in card.photos
+            ]
+        else:
+            item.pop("photos")
         items.append(item)
     payload = json.dumps(items, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
     if len(payload) > MAX_DOCUMENT_DATA:
@@ -113,10 +171,11 @@ def decode_cards(payload: bytes) -> tuple[Card, ...]:
         if not isinstance(items, list):
             raise ValueError("Ожидается список карточек.")
         cards = []
-        required = {field.name for field in fields(Card)} - {"archive_number"}
+        optional = {"archive_number", "photos"}
+        required = {field.name for field in fields(Card)} - optional
         numbers = set()
         for index, item in enumerate(items, start=1):
-            if not isinstance(item, dict) or set(item) - {"archive_number"} != required:
+            if not isinstance(item, dict) or set(item) - optional != required:
                 raise ValueError("Некорректная карточка документа.")
             number = item.setdefault("archive_number", index)
             if type(number) is not int or number < 1 or number in numbers:
@@ -124,12 +183,27 @@ def decode_cards(payload: bytes) -> tuple[Card, ...]:
             numbers.add(number)
             if item["pdf"] is not None:
                 item["pdf"] = base64.b64decode(item["pdf"], validate=True)
+            if "photos" in item:
+                photos = item["photos"]
+                if not isinstance(photos, list):
+                    raise ValueError("Некорректный список фотографий.")
+                item["photos"] = tuple(
+                    Photo(photo["name"], base64.b64decode(photo["data"], validate=True))
+                    for photo in photos
+                )
             card = Card(**item)
             card.validate()
             cards.append(card)
         return tuple(cards)
-    except (ValueError, TypeError, UnicodeError) as exc:
+    except (ValueError, TypeError, KeyError, UnicodeError) as exc:
         raise ValueError("Не удалось прочитать карточки документов.") from exc
+
+
+def _location_order(value: str) -> tuple:
+    return tuple(
+        (1, int(part)) if part.isdecimal() else (0, part)
+        for part in re.split(r"(\d+)", value.casefold())
+    )
 
 
 @dataclass(frozen=True)
@@ -176,6 +250,21 @@ class Catalog:
             for name in tag_names(card.tags):
                 names.setdefault(name.casefold(), name)
         return tuple(names[key] for key in sorted(names))
+
+    def folder_inventory(self) -> dict[tuple[str, str], tuple[Card, ...]]:
+        folders: dict[tuple[str, str], list[Card]] = {}
+        names = {}
+        for card in self.cards:
+            cabinet, folder = card.cabinet.strip(), card.folder.strip()
+            if folder:
+                key = names.setdefault((cabinet.casefold(), folder.casefold()), (cabinet, folder))
+                folders.setdefault(key, []).append(card)
+        return {
+            key: tuple(sorted(folders[key], key=lambda card: (
+                _location_order(card.section), _location_order(card.position), card.archive_number,
+            )))
+            for key in sorted(folders, key=lambda pair: tuple(_location_order(part) for part in pair))
+        }
 
     def set_tags(self, index: int, value: str) -> "Catalog":
         if not 0 <= index < len(self.cards):
