@@ -40,6 +40,10 @@ class Movement:
     amount: int
     command: str
     operation: int | None = None
+    day: str = ""
+
+    def effective_day(self, ledger: Ledger) -> str:
+        return operation(ledger, self.operation).day if self.operation is not None else self.day
 
 
 @dataclass(frozen=True)
@@ -66,6 +70,9 @@ class Funds:
         for fund in payload["funds"]:
             if not fund["deadline"]:
                 del fund["deadline"]
+        for move in payload["movements"]:
+            if not move["day"]:
+                del move["day"]
         return payload
 
     @classmethod
@@ -145,13 +152,18 @@ class Funds:
             fund = self.fund(move.fund)
             if type(move.amount) is not int or not move.amount or not isinstance(move.command, str) or not move.command:
                 raise ValueError("Движение фонда должно содержать ненулевую сумму.")
-            if move.command in commands and move.operation != commands[move.command]:
-                raise ValueError("Одна команда должна относиться к одной операции.")
+            if not isinstance(move.day, str) or (move.operation is not None and move.day):
+                raise ValueError("Дата движения определяется связанной операцией.")
+            if move.day:
+                _day(move.day)
+            source = move.operation, move.day
+            if move.command in commands and source != commands[move.command]:
+                raise ValueError("Движения одной команды должны иметь общую дату и основание.")
             key = (move.command, move.fund)
             if key in movements:
                 raise ValueError("Фонд уже затронут этой командой.")
             movements.add(key)
-            commands[move.command] = move.operation
+            commands[move.command] = source
             balances[fund.number] += move.amount
             if balances[fund.number] < 0:
                 raise ValueError("В фонде недостаточно средств для этого действия.")
@@ -212,14 +224,26 @@ class Funds:
         return tuple(moves)
 
     def apply(
-        self, command: str, moves: tuple[tuple[int, int], ...], operation_number: int | None = None
+        self, command: str, moves: tuple[tuple[int, int], ...], operation_number: int | None = None,
+        *, day: str | None = None,
     ) -> "Funds":
         if any(item.command == command for item in self.movements):
             return self
         if operation_number is not None and any(item.operation == operation_number for item in self.movements):
             raise ValueError("Операция уже учтена в фондах.")
+        if operation_number is not None and day is not None:
+            raise ValueError("Для связанного движения используется дата операции.")
+        day = _day(day if day is not None else date.today().isoformat()) if operation_number is None else ""
         return replace(self, movements=(
-            *self.movements, *(Movement(number, amount, command, operation_number) for number, amount in moves),
+            *self.movements, *(Movement(number, amount, command, operation_number, day) for number, amount in moves),
+        ))
+
+    def date_movement(self, command: str, day: str) -> "Funds":
+        day = _day(day)
+        if not any(move.command == command and move.operation is None for move in self.movements):
+            raise ValueError("Выберите ручное движение фонда.")
+        return replace(self, movements=tuple(
+            replace(move, day=day) if move.command == command else move for move in self.movements
         ))
 
     def undo(self, command: str) -> "Funds":

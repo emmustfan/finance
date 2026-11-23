@@ -825,7 +825,7 @@ class ArchiveWindow(QMainWindow):
                 review = Review()
                 funds = Funds(funds=(Fund("Семейный резерв", "Подушка", "RUB", 10_000_000, 1),))
                 funds = funds.set_template(Template("RUB", (Line(1, "fixed", 6_500_000),)))
-                funds = funds.apply("demo-opening", ((1, 500_000),))
+                funds = funds.apply("demo-opening", ((1, 500_000),), day=ledger.openings[0].day)
             catalog = Catalog.create(path, password, cards=cards, assets=assets, ledger=ledger,
                                      review=review, funds=funds, scope=scope)
         except (OSError, ValueError) as exc:

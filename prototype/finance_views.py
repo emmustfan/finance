@@ -13,6 +13,7 @@ from PySide6.QtWidgets import (
     QMenu, QMessageBox, QProgressBar, QTabWidget, QVBoxLayout, QWidget,
 )
 
+from analytics_views import AnalyticsPanel
 from appearance import ChoiceBox, area, button, frame, label
 from asset_views import AssetEditor, RegistryDialog
 from assets import amount_text, parse_amount
@@ -381,6 +382,7 @@ class FinanceDialog(QDialog):
         self.rows = ()
         self.filtered = ()
         self.article_filter = None
+        self.operation_account = None
         self.goal_funds = ()
         self.setWindowTitle("Финансы")
         self.resize(1110, 740)
@@ -400,7 +402,8 @@ class FinanceDialog(QDialog):
 
         filters = QHBoxLayout()
         self.range = ChoiceBox()
-        for key, text in (("month", "Последний месяц"), ("week", "7 дней"), ("quarter", "3 месяца"),
+        for key, text in (("current", "Этот месяц"), ("week", "7 дней"), ("month", "Последний месяц"),
+                          ("quarter", "3 месяца"), ("year", "12 месяцев"),
                           ("all", "Весь период"), ("custom", "Свой период")):
             self.range.addItem(text, key)
         self.currency = ChoiceBox()
@@ -424,7 +427,9 @@ class FinanceDialog(QDialog):
         filters.addWidget(self.currency)
         layout.addLayout(filters)
 
-        metrics = QHBoxLayout()
+        self.metric_strip = QWidget()
+        metrics = QHBoxLayout(self.metric_strip)
+        metrics.setContentsMargins(0, 0, 0, 0)
         self.metrics = {}
         for key, text, style in (
             ("income", "Доходы за период", "financePositive"),
@@ -440,7 +445,7 @@ class FinanceDialog(QDialog):
             stack.addWidget(number)
             self.metrics[key] = number
             metrics.addWidget(tile, 1)
-        layout.addLayout(metrics)
+        layout.addWidget(self.metric_strip)
         self.error = label(style="financeError")
         self.error.hide()
         layout.addWidget(self.error)
@@ -448,13 +453,19 @@ class FinanceDialog(QDialog):
         self.tabs = QTabWidget()
         self.tabs.setObjectName("financeTabs")
         self.tabs.addTab(self.build_dashboard(), "Итоги")
+        self.analytics = AnalyticsPanel()
+        self.analytics.operations_requested.connect(self.open_article_filter)
+        self.analytics.fund_requested.connect(self.open_fund_history)
+        self.tabs.addTab(self.analytics, "Аналитика")
         self.operation_page = self.build_operations()
         self.tabs.addTab(self.operation_page, "Операции")
         self.tabs.addTab(self.build_wallets(), "Кошельки и цели")
         self.debt_panel = DebtPanel(self)
         self.debt_panel.catalog_changed.connect(self.updated_debt)
+        self.debt_panel.report_requested.connect(lambda number: self.open_graph("debt", subject=number))
         self.tabs.addTab(self.debt_panel, "Долги")
         self.tabs.addTab(self.build_investments(), "Инвестиции и вклады")
+        self.tabs.currentChanged.connect(self.update_metric_visibility)
         layout.addWidget(self.tabs, 1)
         bottom = QHBoxLayout()
         bottom.addStretch(1)
@@ -478,6 +489,9 @@ class FinanceDialog(QDialog):
         layout = QVBoxLayout(widget)
         layout.setContentsMargins(14, 11, 14, 14)
         return widget, layout
+
+    def update_metric_visibility(self):
+        self.metric_strip.setVisible(self.tabs.currentWidget() is not self.analytics)
 
     def build_dashboard(self):
         widget, layout = self.page()
@@ -509,6 +523,7 @@ class FinanceDialog(QDialog):
         actions.addWidget(self.unclassified_button)
         self.distribute_button = button("Распределить деньги…", self.distribute, primary=True)
         actions.addWidget(self.distribute_button)
+        actions.addWidget(button("Аналитика", lambda: self.open_graph("expense")))
         actions.addWidget(button("Разбор и регулярные платежи…", self.open_review))
         actions.addWidget(button("Активы и ближайшие платежи…", self.overview))
         actions.addStretch(1)
@@ -571,6 +586,7 @@ class FinanceDialog(QDialog):
         )
         layout.addWidget(self.goal_caption)
         tools = QHBoxLayout()
+        tools.addWidget(button("График накоплений", self.open_savings_graph))
         self.goals_distribute = button("Распределить деньги…", self.distribute, primary=True)
         tools.addWidget(self.goals_distribute)
         self.goal_edit = button("Изменить цель…", self.edit_goal)
@@ -609,14 +625,24 @@ class FinanceDialog(QDialog):
         if selected == "custom":
             return
         today = QDate.currentDate()
-        posted = [QDate.fromString(entry.day, Qt.DateFormat.ISODate) for entry in self.catalog.ledger.entries]
         if selected == "all":
-            start, end = min(posted, default=today), max([today, *posted])
+            dates = [entry.day for entry in self.catalog.ledger.entries]
+            dates.extend(opening.day for opening in self.catalog.ledger.openings)
+            dates.extend(debt.day for debt in self.catalog.review.debts.items)
+            dates.extend(move.day for move in self.catalog.funds.movements if move.day)
+            dates.extend(asset.as_of for asset in self.catalog.assets if asset.category == "account" and asset.as_of)
+            now = today.toString(Qt.DateFormat.ISODate)
+            start = QDate.fromString(min(dates, default=now), Qt.DateFormat.ISODate)
+            end = QDate.fromString(max(now, max(dates, default=now)), Qt.DateFormat.ISODate)
         else:
             end = today
-            start = today.addDays(-6) if selected == "week" else today.addMonths(
-                -3 if selected == "quarter" else -1
-            ).addDays(1)
+            if selected == "current":
+                start = QDate(today.year(), today.month(), 1)
+            elif selected == "week":
+                start = today.addDays(-6)
+            else:
+                months = {"quarter": 3, "year": 12, "month": 1}[selected]
+                start = today.addMonths(-months).addDays(1)
         self.start.blockSignals(True)
         self.end.blockSignals(True)
         self.start.setDate(start)
@@ -649,6 +675,7 @@ class FinanceDialog(QDialog):
 
     def refresh(self):
         currency = self.currency.currentData() or "RUB"
+        first = last = None
         try:
             start, end = self.bounds()
             self.rows = activity(self.catalog.ledger, self.catalog.review, start, end, currency,
@@ -661,8 +688,10 @@ class FinanceDialog(QDialog):
             self.error.show()
         else:
             self.error.hide()
+            first, last = date.fromisoformat(start), date.fromisoformat(end)
             self.chart.set_period(self.rows, start, end)
             self.compare_period(start, end, currency)
+        self.analytics.refresh(self.catalog, self.rows, first, last, currency, tagged=bool(self.tag_filter.currentData()))
         income, expense = flow_totals(self.rows)
         cash = self.catalog.liquid_totals().get(currency, 0)
         reserved = self.catalog.funds.reserved().get(currency, 0)
@@ -769,20 +798,27 @@ class FinanceDialog(QDialog):
         self.update_operation_buttons()
         self.filter_notice.setVisible(self.article_filter is not None)
         if self.article_filter is not None:
-            self.filter_notice.setText(self.article_filter[1].replace("&", "&&") + "  ×")
+            kind, category = self.article_filter
+            title = category or ("Расходы" if kind == "expense" else "Доходы")
+            if self.operation_account is not None:
+                title += "  ·  " + titles[self.operation_account]
+            self.filter_notice.setText(title.replace("&", "&&") + "  ×")
 
     @staticmethod
     def is_unclassified(row):
         return row.kind in ("income", "expense") and row.category == UNCATEGORIZED
 
     def matches_article(self, row):
+        if self.operation_account is not None and row.account != self.operation_account:
+            return False
         if self.article_filter is None:
             return True
         kind, category = self.article_filter
         if kind == "missing":
             return self.is_unclassified(row)
         amount = row.income if kind == "income" else row.expense
-        return bool(amount and (("Комиссии банка" if row.fee else row.category) == category))
+        name = row.category if kind == "income" else row.expense_category
+        return bool(amount and (category is None or name == category))
 
     def drill_down(self, widget, index, kind):
         self.open_article_filter(kind, widget.item(index, 0).text())
@@ -790,15 +826,26 @@ class FinanceDialog(QDialog):
     def show_unclassified(self):
         self.open_article_filter("missing", UNCATEGORIZED)
 
-    def open_article_filter(self, kind, category):
+    def open_article_filter(self, kind, category, account=None):
         self.article_filter = kind, category
+        self.operation_account = account
         self.search.clear()
         self.tabs.setCurrentWidget(self.operation_page)
         self.refresh_operations()
 
     def clear_article_filter(self):
         self.article_filter = None
+        self.operation_account = None
         self.refresh_operations()
+
+    def open_graph(self, mode, *, subject=None):
+        self.tabs.setCurrentWidget(self.analytics)
+        self.analytics.switch(mode, subject=subject)
+
+    def open_savings_graph(self):
+        row = self.goal_table.currentRow()
+        subject = str(self.goal_funds[row].number) if 0 <= row < len(self.goal_funds) else "funds"
+        self.open_graph("saving", subject=subject)
 
     def refresh_positions(self, currency):
         assets = [self.catalog.recorded_value(asset) for asset in self.catalog.assets
@@ -885,6 +932,7 @@ class FinanceDialog(QDialog):
             self.use_catalog(catalog)
             return
         self.article_filter = None
+        self.operation_account = None
         self.search.blockSignals(True)
         self.search.clear()
         self.search.blockSignals(False)
@@ -1102,6 +1150,14 @@ class FinanceDialog(QDialog):
         dialog = FundsDialog(self, self.catalog)
         dialog.exec()
         self.use_catalog(dialog.catalog)
+
+    def open_fund_history(self, number):
+        index = next((index for index, fund in enumerate(self.catalog.funds.funds) if fund.number == number), None)
+        if index is not None:
+            dialog = FundsDialog(self, self.catalog)
+            dialog.grid.selectRow(index)
+            dialog.history(window_parent=self)
+            self.use_catalog(dialog.catalog)
 
     def overview(self):
         OverviewDialog(self, self.catalog).exec()

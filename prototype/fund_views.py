@@ -249,6 +249,7 @@ class FundsDialog(QDialog):
             return
         values = DetailsDialog(self, fund.title, "Введите положительную сумму для пополнения или отрицательную для освобождения резерва.", (
             ("amount", f"Сумма, {fund.currency}", "", "0,00"),
+            ("day", "Дата движения", date.today().isoformat(), "ГГГГ-ММ-ДД"),
         )).values()
         if values is None:
             return
@@ -258,7 +259,7 @@ class FundsDialog(QDialog):
                 raise ValueError("Введите ненулевую сумму.")
             if amount > max(0, self.available(fund.currency)):
                 raise ValueError("Свободных денег в этой валюте недостаточно.")
-            self.save(self.catalog.funds.apply(uuid4().hex, ((fund.number, amount),)))
+            self.save(self.catalog.funds.apply(uuid4().hex, ((fund.number, amount),), day=values["day"]))
         except ValueError as exc:
             QMessageBox.warning(self, "Фонд", str(exc))
 
@@ -271,36 +272,70 @@ class FundsDialog(QDialog):
         if QMessageBox.question(self, "Оплата из фонда", text) == QMessageBox.StandardButton.Yes:
             self.save(self.catalog.funds.apply(f"expense:{number}", ((fund.number, entry.amount),), number))
 
-    def history(self):
+    def history(self, *, window_parent=None):
         fund = self.selected()
         if fund is None:
             return
-        dialog = QDialog(self)
+        dialog = QDialog(window_parent if window_parent is not None else self)
         dialog.setWindowTitle("Движения фонда")
-        dialog.resize(660, 420)
+        dialog.resize(740, 450)
         layout = QVBoxLayout(dialog)
         layout.setContentsMargins(20, 18, 20, 18)
         layout.addWidget(label(fund.title, "screenTitle"))
-        moves = tuple(move for move in self.catalog.funds.movements if move.fund == fund.number)
-        grid = table(("Сумма", "Основание"), 1)
+        moves = ()
+        grid = table(("Дата", "Сумма", "Основание"), 2)
         entries = self.catalog.ledger.entries
-        fill_table(grid, [
-            (amount_text(move.amount),
-             f"№ {move.operation} · {entries[move.operation - 1].description}" if move.operation else "Ручное движение")
-            for move in moves
-        ])
         layout.addWidget(grid, 1)
-        if self.catalog.editable and moves:
-            def undo():
-                row = grid.currentRow()
-                if row < 0:
+
+        def refresh():
+            nonlocal moves
+            row = grid.currentRow()
+            moves = tuple(move for move in self.catalog.funds.movements if move.fund == fund.number)
+            fill_table(grid, [
+                (move.effective_day(self.catalog.ledger) or "—", amount_text(move.amount),
+                 f"№ {move.operation} · {entries[move.operation - 1].description}" if move.operation else "Ручное движение")
+                for move in moves
+            ])
+            if moves:
+                grid.selectRow(max(0, min(row, len(moves) - 1)))
+            selection_changed()
+
+        def selection_changed():
+            row = grid.currentRow()
+            selected = self.catalog.editable and 0 <= row < len(moves)
+            change_day.setEnabled(selected and moves[row].operation is None)
+            undo_move.setEnabled(selected)
+
+        def date_move():
+            row = grid.currentRow()
+            move = moves[row]
+            text, ok = QInputDialog.getText(dialog, "Дата движения", "Введите дату в формате ГГГГ-ММ-ДД",
+                                            text=move.day)
+            if ok:
+                try:
+                    updated = self.catalog.funds.date_movement(move.command, text.strip())
+                except ValueError as exc:
+                    QMessageBox.warning(dialog, "Дата движения", str(exc))
                     return
-                consent = QMessageBox.question(dialog, "Отмена", "Отменить выбранное движение во всех затронутых фондах?")
-                if consent == QMessageBox.StandardButton.Yes and self.save(self.catalog.funds.undo(moves[row].command)):
-                    dialog.accept()
-            close_bar(dialog, layout, undo, "Отменить движение")
-        else:
-            close_bar(dialog, layout)
+                if self.save(updated):
+                    refresh()
+
+        def undo():
+            row = grid.currentRow()
+            consent = QMessageBox.question(dialog, "Отмена", "Отменить выбранное движение во всех затронутых фондах?")
+            if consent == QMessageBox.StandardButton.Yes and self.save(self.catalog.funds.undo(moves[row].command)):
+                refresh()
+
+        actions = QHBoxLayout()
+        change_day = button("Указать дату…", date_move)
+        undo_move = button("Отменить движение…", undo)
+        actions.addWidget(change_day)
+        actions.addWidget(undo_move)
+        actions.addStretch(1)
+        actions.addWidget(button("Готово", dialog.accept, primary=True))
+        layout.addLayout(actions)
+        grid.itemSelectionChanged.connect(selection_changed)
+        refresh()
         dialog.exec()
 
 

@@ -164,6 +164,10 @@ class Activity:
     def expense(self) -> int:
         return max(0, -self.amount - self.principal) if self.kind != "transfer" else self.fee
 
+    @property
+    def expense_category(self) -> str:
+        return "Комиссии банка" if self.fee else self.category
+
 
 def activity(ledger: Ledger, review: Review, start: str, end: str, currency="", *, tag="") -> tuple[Activity, ...]:
     period(start, end)
@@ -206,8 +210,7 @@ def flow_breakdown(rows: tuple[Activity, ...]) -> dict[tuple[str, str, str], int
         if row.income:
             result[row.currency, "income", row.category] += row.income
         if row.expense:
-            category = "Комиссии банка" if row.fee else row.category
-            result[row.currency, "expense", category] += row.expense
+            result[row.currency, "expense", row.expense_category] += row.expense
     return dict(result)
 
 

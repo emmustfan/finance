@@ -236,6 +236,7 @@ class DebtTerms(QDialog):
 
 class DebtPanel(QWidget):
     catalog_changed = Signal(object)
+    report_requested = Signal(int)
 
     def __init__(self, parent):
         super().__init__(parent)
@@ -258,9 +259,10 @@ class DebtPanel(QWidget):
         actions.addWidget(self.empty)
         actions.addStretch(1)
         self.history_button = button("История…", self.history)
+        self.graph_button = button("График", self.open_graph)
         self.terms_button = button("Условия…", self.terms)
         self.pay_button = button("Записать возврат…", self.pay, primary=True)
-        for control in (self.history_button, self.terms_button, self.pay_button):
+        for control in (self.history_button, self.graph_button, self.terms_button, self.pay_button):
             actions.addWidget(control)
         layout.addLayout(actions)
 
@@ -297,6 +299,7 @@ class DebtPanel(QWidget):
     def refresh_actions(self):
         item = self.selected()
         self.history_button.setEnabled(item is not None)
+        self.graph_button.setEnabled(item is not None)
         self.terms_button.setEnabled(item is not None and self.catalog.editable)
         self.pay_button.setEnabled(item is not None and self.catalog.editable)
         self.pay_button.setText("Записать возврат…" if item is None or self.remaining[item.number]
@@ -318,6 +321,10 @@ class DebtPanel(QWidget):
             dialog = DebtTerms(self, self.catalog, item)
             if dialog.exec() == QDialog.DialogCode.Accepted:
                 self.catalog_changed.emit(dialog.catalog)
+
+    def open_graph(self):
+        if item := self.selected():
+            self.report_requested.emit(item.number)
 
     def history(self, *_):
         item = self.selected()
