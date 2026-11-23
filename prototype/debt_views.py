@@ -121,7 +121,7 @@ class DebtEditor(QDialog):
             self.link.clear()
             self.link.addItem("Выберите или найдите операцию", None)
             sign = ISSUE_SIGN[self.direction_key()] * (-1 if self.debt else 1)
-            used = self.catalog.review.fixed_operations | {item.operation for item in self.catalog.funds.movements}
+            used = self.catalog.review.reserved_operations | {item.operation for item in self.catalog.funds.movements}
             entries = sorted(enumerate(self.catalog.ledger.entries, 1), key=lambda row: (row[1].day, row[0]), reverse=True)
             for number, entry in entries:
                 asset = self.accounts[entry.account]

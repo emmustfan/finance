@@ -201,7 +201,9 @@ def _encode_catalog(
             content["ledger"] = ledger.to_payload()
         if review != Review():
             content["review"] = review.to_payload()
-        if review.tags or review.debts.items:
+        if review.pending_transfers:
+            content["format_revision"] = 3
+        elif review.tags or review.debts.items:
             content["format_revision"] = 2
         if funds != Funds():
             content["funds"] = funds.to_payload()
@@ -226,7 +228,7 @@ def decode_catalog(
         optional_sections = {"ledger", "review", "funds", "directory", "scope", "format_revision"}
         if isinstance(content, dict) and set(content) - optional_sections == {"cards", "assets"}:
             items = content["cards"]
-            if "format_revision" in content and content["format_revision"] != 2:
+            if "format_revision" in content and content["format_revision"] not in (2, 3):
                 raise ValueError("Для этого формата требуется более новая версия приложения.")
             if "ledger" in content:
                 ledger = Ledger.from_payload(content["ledger"])
@@ -455,7 +457,7 @@ class Catalog:
             if not 1 <= number <= len(ledger.entries):
                 raise ValueError("Операция не найдена.")
             old = ledger.entries[number - 1]
-            if old.source != "manual" or number in review.fixed_operations or any(
+            if old.source != "manual" or number in review.reserved_operations or any(
                 move.operation == number for move in self.funds.movements
             ):
                 raise ValueError("Для этой операции доступны статьи в разделе разбора. Денежные движения связаны с другими записями.")

@@ -7,6 +7,7 @@ from unittest.mock import patch
 
 from assets import Asset
 from documents import Card, Catalog
+from finance import activity, flow_totals
 from funds import Fund, Funds, Line, Template
 from ledger import Entry, Ledger, Opening, preview_import, read_statement
 from review import Assignment, Recurring, Review, Rule, TAX_PAYMENT
@@ -140,6 +141,63 @@ class PlanningTest(unittest.TestCase):
                          {("RUB", "Доходы", "Выручка ИП"): 5_000_000})
         self.assertEqual(catalog.review.tax_reserve(catalog.ledger, "2026-11-01", "2026-11-30"),
                          (5_000_000, 300_000))
+
+    def test_imported_transfer_saves_the_second_wallet_and_counts_only_the_fee(self):
+        path = self.root / "transfer.fvault"
+        catalog = Catalog.create(path, PASSWORD, assets=(
+            Asset("Откуда", "account", "Семья"),
+            Asset("Куда", "account", "Семья"),
+            Asset("Другой счёт", "account", "Семья"),
+        ), ledger=Ledger(openings=(
+            Opening(1, "2026-10-31", 200_000, "RUB", "A"),
+            Opening(2, "2026-10-31", 300_000, "RUB", "B"),
+            Opening(3, "2026-10-31", 400_000, "RUB", "C"),
+        )))
+        first = self.root / "outgoing.csv"
+        first.write_text("Дата;Сумма;Описание\n2026-11-05;-1030,00;Перевод\n", encoding="utf-8")
+        statement = read_statement(first)
+        preview = preview_import(catalog.ledger, 1, statement, statement.suggested_columns())
+        catalog = catalog.save_ledger(preview.apply(catalog.ledger, set()))
+        ledger = catalog.ledger
+        waiting = catalog.review.wait_for_transfer(ledger, 1, 2)
+        catalog.save_review(waiting)
+        reopened = Catalog.open(path, PASSWORD)
+        self.assertEqual(reopened.ledger, ledger)
+        self.assertEqual(reopened.review.transfer_targets(), {1: 2})
+        rows = activity(ledger, reopened.review, "2026-11-01", "2026-11-30")
+        self.assertEqual((rows[0].kind, rows[0].pair, rows[0].transfer_account), ("transfer", None, 2))
+        self.assertEqual(flow_totals(rows), (0, 0))
+        self.assertEqual(reopened.review.report(ledger, "2026-11-01", "2026-11-30"), {})
+
+        second = self.root / "incoming.csv"
+        second.write_text("Дата;Сумма;Описание\n2026-11-06;+1000,00;Пополнение\n", encoding="utf-8")
+        statement = read_statement(second)
+        preview = preview_import(ledger, 2, statement, statement.suggested_columns())
+        ledger = preview.apply(ledger, set()).add_manual(Entry(3, "2026-11-05", 100_000, "Другая операция"))
+        posted = reopened.save_ledger(ledger)
+        candidate, = posted.review.transfer_candidates(ledger, 1)
+        self.assertEqual(candidate[:2], (2, 3000))
+        with self.assertRaisesRegex(ValueError, "другой счёт"):
+            posted.review.link_transfer(ledger, 1, 3)
+        connected = posted.save_review(posted.review.link_transfer(ledger, 1, 2))
+        self.assertEqual(connected.review.transfer_targets(), {})
+        self.assertEqual(connected.review.waiting, ())
+        self.assertEqual(connected.ledger, ledger)
+        rows = activity(ledger, connected.review, "2026-11-01", "2026-11-30")
+        self.assertEqual(flow_totals(rows), (100_000, 3000))
+        self.assertEqual({row.number: row.transfer_account for row in rows if row.kind == "transfer"}, {1: 2, 2: 1})
+
+    def test_candidate_search_can_show_later_rows_and_omit_reserved_operations(self):
+        ledger = Ledger(openings=(Opening(1, "2026-10-31", 0, "RUB"), Opening(2, "2026-10-31", 0, "RUB")),
+                        entries=(Entry(1, "2026-11-05", -120_000, "Списание"),
+                                 Entry(2, "2026-11-10", 110_000, "Зачисление"),
+                                 Entry(2, "2026-11-05", 120_000, "Зачисление")))
+        review = Review().wait_for_transfer(ledger, 1, 2)
+        self.assertEqual([row[0] for row in review.transfer_candidates(ledger, 1)], [3])
+        extra, = review.transfer_candidates(ledger, 1, include_other=True, excluded=frozenset({3}))
+        self.assertEqual(extra[:2], (2, 10_000))
+        self.assertEqual(review.unlink(1).transfer_targets(), {})
+        self.assertEqual(review.assign((Assignment(1, "Кафе"),)).waiting, ())
 
     def test_explicit_archive_scope_and_family_group_file_modes(self):
         shared = self.root / "shared"

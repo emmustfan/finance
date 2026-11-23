@@ -97,6 +97,140 @@ class CategoryDialog(QDialog):
         close_bar(self, layout, save, "Подтвердить")
 
 
+class TransferDialog(QDialog):
+    def __init__(self, parent, catalog, number: int):
+        super().__init__(parent)
+        self.result_review = catalog.review
+        self.ledger, self.review, self.number = catalog.ledger, catalog.review, number
+        self.entry = self.ledger.entries[number - 1]
+        self.assets = {asset.asset_number: asset for asset in catalog.assets if asset.category == "account"}
+        self.currency = self.assets[self.entry.account].currency
+        self.excluded = frozenset(move.operation for move in catalog.funds.movements if move.operation is not None)
+        self.setWindowTitle("Перевод между своими счетами")
+        self.resize(800, 485)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(20, 18, 20, 18)
+        layout.addWidget(label(self.windowTitle(), "screenTitle"))
+        layout.addWidget(label(self.entry_caption(number), "sectionTitle", wrap=True))
+        layout.addWidget(label(self.entry.description, "muted", wrap=True))
+
+        pair = next((item for item in self.review.transfers if number in (item.debit, item.credit)), None)
+        if pair is not None:
+            other = pair.credit if number == pair.debit else pair.debit
+            layout.addSpacing(10)
+            layout.addWidget(label(self.entry_caption(other), "sectionTitle", wrap=True))
+            layout.addWidget(label(self.ledger.entries[other - 1].description, "muted", wrap=True))
+            layout.addWidget(label(f"Комиссия · {amount_text(pair.fee)} {self.currency}", "muted"))
+            layout.addStretch(1)
+            close_bar(self, layout, self.unlink, "Снять связь")
+            self.resize(600, 300)
+            return
+
+        self.account = ChoiceBox()
+        self.account.setAccessibleName("Счёт назначения" if self.entry.amount < 0 else "Счёт отправления")
+        self.account.addItem("Выберите счёт", None)
+        compatible = [item for item in self.assets.values()
+                      if item.asset_number != self.entry.account and item.currency == self.currency]
+        for item in compatible:
+            self.account.addItem(f"{item.title} · {item.owner} · {item.currency}", item.asset_number)
+        selected = self.review.transfer_targets().get(number)
+        if selected is None:
+            if len(compatible) == 1:
+                selected = compatible[0].asset_number
+            elif compatible:
+                suggested = self.review.transfer_candidates(self.ledger, number, excluded=self.excluded)
+                accounts = {self.ledger.entries[other - 1].account for other, _, _ in suggested}
+                if len(accounts) == 1:
+                    selected = next(iter(accounts))
+        self.account.setCurrentIndex(max(0, self.account.findData(selected)))
+        form = QFormLayout()
+        form.addRow(self.account.accessibleName(), self.account)
+        layout.addLayout(form)
+        self.more = QCheckBox("Показать остальные операции в пределах 7 дней")
+        layout.addWidget(self.more)
+        self.grid = table(("№", "Дата", "Сумма", "Описание", "Комиссия", "Совпадение"), 3)
+        self.grid.setAccessibleName("Вторая сторона перевода")
+        self.grid.cellDoubleClicked.connect(lambda *_: self.link())
+        layout.addWidget(self.grid, 1)
+        self.hint = label(style="muted", wrap=True)
+        layout.addWidget(self.hint)
+        actions = QHBoxLayout()
+        if number in self.review.waiting:
+            actions.addWidget(button("Снять отметку", self.unlink))
+        actions.addStretch(1)
+        actions.addWidget(button("Отмена", self.reject))
+        self.wait_button = button("Ждать выписку", self.wait)
+        self.link_button = button("Связать операции", self.link, primary=True)
+        actions.addWidget(self.wait_button)
+        actions.addWidget(self.link_button)
+        layout.addLayout(actions)
+        self.candidates = ()
+        self.account.currentIndexChanged.connect(self.refresh)
+        self.more.toggled.connect(self.refresh)
+        self.grid.itemSelectionChanged.connect(self.refresh_link_button)
+        self.refresh()
+
+    def entry_caption(self, number):
+        entry = self.ledger.entries[number - 1]
+        direction = "Со счёта" if entry.amount < 0 else "На счёт"
+        return (f"{direction} «{self.assets[entry.account].title}» · "
+                f"{amount_text(abs(entry.amount))} {self.currency} · {entry.day}")
+
+    def refresh(self):
+        account = self.account.currentData()
+        self.candidates = self.review.transfer_candidates(
+            self.ledger, self.number, account=account, include_other=self.more.isChecked(), excluded=self.excluded,
+        ) if account is not None else ()
+        fill_table(self.grid, [
+            (number, entry.day, amount_text(entry.amount), entry.description, amount_text(fee), reason)
+            for number, fee, reason in self.candidates for entry in (self.ledger.entries[number - 1],)
+        ])
+        self.grid.clearSelection()
+        self.grid.setCurrentCell(-1, -1)
+        if len(self.candidates) == 1:
+            self.grid.selectRow(0)
+        self.refresh_link_button()
+        self.wait_button.setEnabled(account is not None and self.number not in self.excluded)
+        self.more.setEnabled(account is not None and self.number not in self.excluded)
+        if self.number in self.excluded:
+            message = "Операция учтена в фонде. Снимите её связь с фондом, чтобы отметить перевод."
+        elif self.account.count() == 1:
+            message = "Добавьте второй счёт в этой валюте в разделе «Кошельки и цели»."
+        elif account is None:
+            message = "Выберите второй счёт, чтобы увидеть доступные операции."
+        elif self.candidates:
+            message = "Выберите вторую строку. Разница сумм учитывается как комиссия."
+        elif not self.more.isChecked():
+            message = "Совпадений пока нет. Посмотрите остальные операции или сохраните счёт и дождитесь выписки."
+        else:
+            message = "Подходящих строк пока нет. Можно сохранить счёт и вернуться после импорта выписки."
+        self.hint.setText(message)
+
+    def refresh_link_button(self):
+        self.link_button.setEnabled(bool(self.grid.selectedItems()) and self.grid.currentRow() >= 0)
+
+    def link(self):
+        if not self.link_button.isEnabled():
+            return
+        try:
+            staged = self.review.wait_for_transfer(self.ledger, self.number, self.account.currentData())
+            self.result_review = staged.link_transfer(self.ledger, self.number, self.candidates[self.grid.currentRow()][0])
+        except ValueError as exc:
+            self.hint.setText(str(exc))
+            return
+        self.accept()
+
+    def wait(self):
+        if not self.wait_button.isEnabled():
+            return
+        self.result_review = self.review.wait_for_transfer(self.ledger, self.number, self.account.currentData())
+        self.accept()
+
+    def unlink(self):
+        self.result_review = self.review.unlink(self.number)
+        self.accept()
+
+
 class RecurringDialog(QDialog):
     def __init__(self, parent, catalog, month):
         super().__init__(parent)
@@ -229,6 +363,7 @@ class ReviewDialog(QDialog):
         selected = self.selected()
         review, ledger = self.catalog.review, self.catalog.ledger
         assigned, linked = review.assignments_by_operation(), review.linked
+        targets = review.transfer_targets()
         debt_moves = review.debts.movements()
         self.numbers = sorted(
             (number for number, entry in enumerate(ledger.entries, 1) if start <= entry.day <= end),
@@ -241,6 +376,9 @@ class ReviewDialog(QDialog):
             reason = ""
             if number in linked:
                 status = "Связанный перевод"
+            elif number in targets:
+                status = "Перевод · ждёт пару"
+                reason = f"Второй счёт · {self.names[targets[number]]}"
             elif number in debt_moves:
                 status = debt_moves[number][1]
                 reason = "Связано с долгом"
@@ -283,7 +421,7 @@ class ReviewDialog(QDialog):
 
     def category(self):
         number = self.selected()
-        if number is None or number in self.catalog.review.fixed_operations:
+        if number is None or number in self.catalog.review.reserved_operations:
             return
         dialog = CategoryDialog(self, self.catalog, number)
         if dialog.exec() == QDialog.DialogCode.Accepted:
@@ -291,31 +429,11 @@ class ReviewDialog(QDialog):
 
     def transfer(self):
         number = self.selected()
-        if number is None or number in self.catalog.review.fixed_operations:
+        if number is None or number in self.catalog.review.debts.movements():
             return
-        ledger, review = self.catalog.ledger, self.catalog.review
-        candidates = review.transfer_candidates(ledger, number)
-        if not candidates:
-            self.waiting()
-            return
-        dialog = QDialog(self)
-        dialog.setWindowTitle("Связать перевод")
-        dialog.resize(780, 420)
-        layout = QVBoxLayout(dialog)
-        layout.setContentsMargins(20, 18, 20, 18)
-        layout.addWidget(label("Выберите вторую сторону перевода", "screenTitle"))
-        grid = table(("Дата", "Счёт", "Сумма", "Описание", "Комиссия", "Причина"), 5)
-        data = []
-        for other, fee, reason in candidates:
-            entry = ledger.entries[other - 1]
-            data.append((entry.day, self.names[entry.account], amount_text(entry.amount),
-                         entry.description, amount_text(fee), reason))
-        fill_table(grid, data)
-        grid.selectRow(0)
-        layout.addWidget(grid, 1)
-        close_bar(dialog, layout, dialog.accept, "Подтвердить перевод")
-        if dialog.exec() == QDialog.DialogCode.Accepted and grid.currentRow() >= 0:
-            self.save(review.link_transfer(ledger, number, candidates[grid.currentRow()][0]))
+        dialog = TransferDialog(self, self.catalog, number)
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            self.save(dialog.result_review)
 
     def manual_transfer(self):
         number = self.selected()

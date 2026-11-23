@@ -7,7 +7,7 @@ from datetime import date
 
 from assets import Asset
 from debts import Debts, interest_category
-from ledger import Entry, Ledger, _day, _normalized
+from ledger import Entry, Ledger, _day, _normalized, reference_matches
 
 TRANSFER_WORDS = ("перевод", "transfer", "пополнение вклада", "между счетами", "сбп")
 RULE_FIELDS = {"description": "Описание", "recipient": "Получатель", "bank_category": "Категория банка"}
@@ -19,6 +19,12 @@ class Transfer:
     debit: int
     credit: int
     fee: int
+
+
+@dataclass(frozen=True)
+class PendingTransfer:
+    operation: int
+    account: int
 
 
 @dataclass(frozen=True)
@@ -86,6 +92,7 @@ class Review:
     recurring: tuple[Recurring, ...] = ()
     tags: tuple[OperationTags, ...] = ()
     debts: Debts = Debts()
+    pending_transfers: tuple[PendingTransfer, ...] = ()
 
     def to_payload(self) -> dict:
         payload = asdict(self)
@@ -93,6 +100,8 @@ class Review:
             del payload["tags"]
         if self.debts == Debts():
             del payload["debts"]
+        if not self.pending_transfers:
+            del payload["pending_transfers"]
         return payload
 
     @classmethod
@@ -105,6 +114,7 @@ class Review:
             recurring=tuple(Recurring(**item) for item in payload["recurring"]),
             tags=tuple(OperationTags(item["operation"], tuple(item["names"])) for item in payload.get("tags", ())),
             debts=Debts.from_payload(payload["debts"]) if "debts" in payload else Debts(),
+            pending_transfers=tuple(PendingTransfer(**item) for item in payload.get("pending_transfers", ())),
         )
 
     @property
@@ -117,6 +127,13 @@ class Review:
     @property
     def fixed_operations(self) -> set[int]:
         return self.linked | self.debts.movements().keys()
+
+    def transfer_targets(self) -> dict[int, int]:
+        return {item.operation: item.account for item in self.pending_transfers}
+
+    @property
+    def reserved_operations(self) -> set[int]:
+        return self.fixed_operations | self.transfer_targets().keys()
 
     def tags_by_operation(self) -> dict[int, tuple[str, ...]]:
         return {item.operation: item.names for item in self.tags}
@@ -158,7 +175,8 @@ class Review:
         if self.linked & self.debts.movements().keys():
             raise ValueError("Операция по долгу уже связана с внутренним переводом.")
         fixed = self.fixed_operations
-        seen = set(fixed)
+        targets = self.transfer_targets()
+        seen = fixed | targets.keys()
         for item in self.assignments:
             entry = operation(ledger, item.operation)
             if item.operation in seen or not isinstance(item.category, str) or not item.category.strip():
@@ -175,6 +193,18 @@ class Review:
             operation(ledger, number)
             if number in fixed:
                 raise ValueError("Движение уже связано с переводом или долгом.")
+        if len(targets) != len(self.pending_transfers):
+            raise ValueError("У перевода может быть только один второй счёт.")
+        waiting = set(self.waiting)
+        for item in self.pending_transfers:
+            entry = operation(ledger, item.operation)
+            asset = asset_by_account.get(item.account)
+            if (
+                type(item.account) is not int or item.operation not in waiting
+                or asset is None or asset.category != "account" or asset.asset_number == entry.account
+                or asset.currency != opening_by_account[entry.account].currency
+            ):
+                raise ValueError("Выберите другой счёт в той же валюте.")
         tagged = set()
         for item in self.tags:
             operation(ledger, item.operation)
@@ -219,49 +249,68 @@ class Review:
             raise ValueError("Для перевода выберите списание и зачисление своей валюты на разных счетах, в пределах 7 дней.")
         return -outgoing.amount - incoming.amount
 
-    def transfer_candidates(self, ledger: Ledger, number: int) -> tuple[tuple[int, int, str], ...]:
+    def transfer_candidates(
+        self, ledger: Ledger, number: int, *, account: int | None = None,
+        include_other=False, excluded: frozenset[int] = frozenset(),
+    ) -> tuple[tuple[int, int, str], ...]:
         entry = operation(ledger, number)
-        linked = self.fixed_operations
+        linked = self.fixed_operations | excluded
         if number in linked:
             return ()
         openings = {opening.account: opening for opening in ledger.openings}
         this_open = openings[entry.account]
         current_day = date.fromisoformat(entry.day)
+        targets = self.transfer_targets()
+        if account is None:
+            account = targets.get(number)
         candidates = []
         for other_number, other in enumerate(ledger.entries, 1):
             if (
                 other_number in linked or other.account == entry.account or (other.amount > 0) == (entry.amount > 0)
                 or openings[other.account].currency != this_open.currency
+                or (account is not None and other.account != account)
+                or (other_number in targets and targets[other_number] != entry.account)
             ):
                 continue
             days = abs((current_day - date.fromisoformat(other.day)).days)
-            if days > 3:
+            if days > (7 if include_other else 3):
                 continue
             outgoing, incoming = (entry, other) if entry.amount < 0 else (other, entry)
             fee = -outgoing.amount - incoming.amount
-            refer = (
-                bool(entry.counterparty and openings[other.account].reference)
-                and _normalized(entry.counterparty) == _normalized(openings[other.account].reference)
-            ) or (
-                bool(other.counterparty and this_open.reference)
-                and _normalized(other.counterparty) == _normalized(this_open.reference)
+            refer = reference_matches(entry.counterparty, openings[other.account].reference) or reference_matches(
+                other.counterparty, this_open.reference
             )
-            text = _normalized(f"{entry.description} {other.description}")
-            evidence = refer or any(word in text for word in TRANSFER_WORDS)
-            if fee < 0 or (fee and (not evidence or fee > max(100, incoming.amount // 20))):
+            evidence = refer or any(word in _normalized(f"{entry.description} {other.description}")
+                                    for word in TRANSFER_WORDS)
+            preferred = days <= 3 and (
+                fee == 0 or ((evidence or account is not None) and fee <= max(100, incoming.amount // 20))
+            )
+            if fee < 0 or (not include_other and not preferred):
                 continue
-            reason = f"{'Реквизит совпал · ' if refer else ''}Одна валюта · разница дат {days} дн."
-            reason += " · равные суммы" if not fee else " · разница сумм как комиссия"
-            candidates.append((not refer, not evidence, days, fee, other_number, reason))
+            reason = (
+                ("Реквизит совпал · " if refer else "")
+                + ("Счёт уже выбран · " if other_number in targets else "")
+                + ("в один день" if not days else f"разница {days} дн.")
+            )
+            if not fee:
+                reason += " · суммы совпали"
+            candidates.append((not preferred, not refer, other_number not in targets, not evidence,
+                               days, fee, other_number, reason))
         candidates.sort()
-        return tuple((number, fee, reason) for _, _, _, fee, number, reason in candidates)
+        return tuple((number, fee, reason) for _, _, _, _, _, fee, number, reason in candidates)
 
-    def wait_for_transfer(self, ledger: Ledger, number: int) -> "Review":
-        operation(ledger, number)
-        if number in self.fixed_operations or number in self.waiting:
+    def wait_for_transfer(self, ledger: Ledger, number: int, account: int | None = None) -> "Review":
+        entry = operation(ledger, number)
+        if number in self.fixed_operations:
             return self
-        assignments = tuple(item for item in self.assignments if item.operation != number)
-        return replace(self, waiting=(*self.waiting, number), assignments=assignments)
+        pending = self.pending_transfers
+        if account is not None:
+            if type(account) is not int or account == entry.account:
+                raise ValueError("Выберите другой счёт в той же валюте.")
+            pending = (*(item for item in pending if item.operation != number), PendingTransfer(number, account))
+        waiting = self.waiting if number in self.waiting else (*self.waiting, number)
+        return replace(self, waiting=waiting, pending_transfers=pending,
+                       assignments=tuple(item for item in self.assignments if item.operation != number))
 
     def link_transfer(self, ledger: Ledger, first: int, second: int) -> "Review":
         outgoing, incoming = (first, second) if operation(ledger, first).amount < 0 else (second, first)
@@ -272,15 +321,21 @@ class Review:
         touched = {outgoing, incoming}
         if touched & self.fixed_operations:
             raise ValueError("Одна из операций уже связана с переводом или долгом.")
+        targets = self.transfer_targets()
+        for number, other in ((outgoing, incoming), (incoming, outgoing)):
+            if number in targets and targets[number] != operation(ledger, other).account:
+                raise ValueError("Для одной из операций уже выбран другой счёт перевода.")
         return replace(
             self, transfers=(*self.transfers, pair), waiting=tuple(num for num in self.waiting if num not in touched),
             assignments=tuple(item for item in self.assignments if item.operation not in touched),
+            pending_transfers=tuple(item for item in self.pending_transfers if item.operation not in touched),
         )
 
     def unlink(self, number: int) -> "Review":
         return replace(
             self, transfers=tuple(pair for pair in self.transfers if number not in (pair.debit, pair.credit)),
             waiting=tuple(item for item in self.waiting if item != number),
+            pending_transfers=tuple(item for item in self.pending_transfers if item.operation != number),
         )
 
     def assign(self, items: tuple[Assignment, ...]) -> "Review":
@@ -292,7 +347,8 @@ class Review:
             assignments[item.operation] = item
         confirmed = set(assignments)
         return replace(self, assignments=tuple(assignments.values()),
-                       waiting=tuple(number for number in self.waiting if number not in confirmed))
+                       waiting=tuple(number for number in self.waiting if number not in confirmed),
+                       pending_transfers=tuple(item for item in self.pending_transfers if item.operation not in confirmed))
 
     def classify(self, numbers: tuple[int, ...], category: str) -> "Review":
         if not category:
@@ -307,7 +363,8 @@ class Review:
             raise ValueError("Сначала снимите связь с внутренним переводом.")
         return replace(self, debts=debts,
                        assignments=tuple(item for item in self.assignments if item.operation != attached),
-                       waiting=tuple(item for item in self.waiting if item != attached))
+                       waiting=tuple(item for item in self.waiting if item != attached),
+                       pending_transfers=tuple(item for item in self.pending_transfers if item.operation != attached))
 
     def learn(self, rule: Rule) -> "Review":
         rules = tuple(item for item in self.rules if (item.field, _normalized(item.pattern), item.direction)
@@ -353,7 +410,7 @@ class Review:
     def calendar(self, ledger: Ledger, month: str) -> tuple[tuple[str, Recurring, Entry | None], ...]:
         first = date.fromisoformat(month + "-01")
         last = monthrange(first.year, first.month)[1]
-        used = self.fixed_operations
+        used = self.reserved_operations
         rows = []
         plans = sorted(
             ((first.replace(day=min(item.month_day, last)).isoformat(), item) for item in self.recurring),
@@ -381,6 +438,7 @@ class Review:
         currencies = {item.account: item.currency for item in ledger.openings}
         assigned = self.assignments_by_operation()
         linked = self.linked
+        pending = self.transfer_targets()
         debt_moves = self.debts.movements()
         fees = {pair.debit: pair.fee for pair in self.transfers if pair.fee}
         for number, entry in enumerate(ledger.entries, 1):
@@ -390,6 +448,8 @@ class Review:
             if number in linked:
                 if number in fees:
                     totals[currency, "Расходы", "Комиссии банка"] += fees[number]
+                continue
+            if number in pending:
                 continue
             if number in debt_moves:
                 interest = abs(entry.amount) - debt_moves[number][0]

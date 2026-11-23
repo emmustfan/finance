@@ -155,6 +155,7 @@ class Activity:
     pair: int | None = None
     tags: tuple[str, ...] = ()
     principal: int = 0
+    transfer_account: int | None = None
 
     @property
     def income(self) -> int:
@@ -174,6 +175,7 @@ def activity(ledger: Ledger, review: Review, start: str, end: str, currency="", 
     currencies = {item.account: item.currency for item in ledger.openings}
     assigned = review.assignments_by_operation()
     linked = {number: pair for pair in review.transfers for number in (pair.debit, pair.credit)}
+    targets = review.transfer_targets()
     debt_moves = review.debts.movements()
     tags = review.tags_by_operation()
     tag_key = _normalized(tag)
@@ -185,8 +187,15 @@ def activity(ledger: Ledger, review: Review, start: str, end: str, currency="", 
                 or (tag_key and not any(_normalized(name) == tag_key for name in row_tags))):
             continue
         pair = linked.get(number)
-        kind = "transfer" if pair else "income" if entry.amount > 0 else "expense"
-        category = "Внутренний перевод" if pair else assigned[number].category if number in assigned else UNCATEGORIZED
+        transfer_account = targets.get(number)
+        kind = "income" if entry.amount > 0 else "expense"
+        category = assigned[number].category if number in assigned else UNCATEGORIZED
+        if pair:
+            other = pair.credit if number == pair.debit else pair.debit
+            transfer_account = ledger.entries[other - 1].account
+            kind, category = "transfer", "Внутренний перевод"
+        elif transfer_account is not None:
+            kind, category = "transfer", "Перевод · ждёт пару"
         principal = 0
         if number in debt_moves:
             kind = "debt"
@@ -195,7 +204,7 @@ def activity(ledger: Ledger, review: Review, start: str, end: str, currency="", 
         rows.append(Activity(
             number, entry.day, entry.account, code, entry.amount, kind, category, entry.description,
             entry.recipient, pair.fee if pair and number == pair.debit else 0, pair.debit if pair else None,
-            row_tags, principal,
+            row_tags, principal, transfer_account,
         ))
     return tuple(sorted(rows, key=lambda row: (row.day, row.number), reverse=True))
 

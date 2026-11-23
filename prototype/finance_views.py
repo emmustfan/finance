@@ -26,7 +26,7 @@ from funds import Fund, goal_gap
 from ledger_views import LedgerDialog, import_statements, table
 from operation_controls import TAG_NAMES, TagCells, category_menu, choose_tags, selecting_rows
 from review import period
-from review_views import CategoryDialog, ReviewDialog, fill_table
+from review_views import CategoryDialog, ReviewDialog, TransferDialog, fill_table
 
 
 def display(value, currency):
@@ -373,7 +373,7 @@ class ExportDialog(QDialog):
 
 
 class FinanceDialog(QDialog):
-    ARTICLE, TAGS = 4, 6
+    KIND, ARTICLE, TAGS = 2, 4, 6
 
     def __init__(self, parent, catalog, *, show_operations=False):
         super().__init__(parent)
@@ -538,11 +538,14 @@ class FinanceDialog(QDialog):
         self.search.setClearButtonEnabled(True)
         self.search.textChanged.connect(self.refresh_operations)
         top.addWidget(self.search, 1)
+        self.pending_filter = button("Ждут пару", self.toggle_pending)
+        self.pending_filter.setCheckable(True)
+        top.addWidget(self.pending_filter)
         top.addWidget(button("Выписки и сверка…", self.open_ledger))
         layout.addLayout(top)
         self.filter_notice = button("", self.clear_article_filter)
         layout.addWidget(self.filter_notice, alignment=Qt.AlignmentFlag.AlignLeft)
-        self.operations = table(("Дата", "Кошелёк", "Вид", "Сумма", "Статья  ▾", "Описание", "Теги  ▾"), 5)
+        self.operations = table(("Дата", "Кошелёк", "Вид  ▾", "Сумма", "Статья  ▾", "Описание", "Теги  ▾"), 5)
         self.operations.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         self.operations.setItemDelegateForColumn(self.TAGS, TagCells(self.operations))
         for column, width in ((1, 120), (self.ARTICLE, 163), (self.TAGS, 130)):
@@ -560,6 +563,8 @@ class FinanceDialog(QDialog):
         controls.addWidget(self.edit_button)
         self.classify_button = button("Статья…", self.classify_selected)
         controls.addWidget(self.classify_button)
+        self.transfer_button = button("Перевод…", self.transfer_selected)
+        controls.addWidget(self.transfer_button)
         self.tags_button = button("Теги…", self.tag_selected)
         controls.addWidget(self.tags_button)
         self.rule_button = button("Правило…", self.classify_operation)
@@ -769,13 +774,26 @@ class FinanceDialog(QDialog):
         selected = self.selected_operation()
         query = self.search.text().casefold().split()
         titles = {asset.asset_number: asset.title for asset in self.catalog.assets}
+        pending = sum(row.kind == "transfer" and row.pair is None for row in self.rows)
+        if not pending:
+            self.pending_filter.setChecked(False)
+        waiting_only = self.pending_filter.isChecked()
+        self.pending_filter.setText(f"Ждут пару · {pending}")
+        self.pending_filter.setVisible(bool(pending))
+        articles = {}
+        for row in self.rows:
+            if row.kind == "transfer":
+                target = titles[row.transfer_account]
+                route = f"На «{target}»" if row.amount < 0 else f"С «{target}»"
+                articles[row.number] = f"Ждёт пару · {route}" if row.pair is None else route
         self.filtered = tuple(row for row in self.rows if self.matches_article(row) and all(
-            word in f"{titles[row.account]} {row.category} {row.description} {row.recipient} {' '.join(row.tags)}".casefold()
-            for word in query))
+            word in f"{titles[row.account]} {articles.get(row.number, row.category)} "
+                    f"{row.description} {row.recipient} {' '.join(row.tags)}".casefold()
+            for word in query) and (not waiting_only or (row.kind == "transfer" and row.pair is None)))
         self.operations.blockSignals(True)
         fill_table(self.operations, [
             (row.day, titles[row.account], FLOW_LABELS[row.kind], display(row.amount, row.currency),
-             row.category, row.description + (f" · комиссия {amount_text(row.fee)}" if row.fee else ""),
+             articles.get(row.number, row.category), row.description + (f" · комиссия {amount_text(row.fee)}" if row.fee else ""),
              ", ".join(row.tags))
             for row in self.filtered
         ])
@@ -788,6 +806,11 @@ class FinanceDialog(QDialog):
             if row.kind in ("income", "expense"):
                 article.setText(("Выбрать" if self.is_unclassified(row) else row.category) + "  ▾")
                 article.setForeground(QColor("#146951"))
+            if row.kind != "debt":
+                kind = self.operations.item(index, self.KIND)
+                kind.setText(f"{FLOW_LABELS[row.kind]}  ▾")
+                kind.setForeground(QColor("#146951"))
+                kind.setToolTip("Перевод между своими счетами")
             tag.setText((", ".join(row.tags) if row.tags else "+ Тег") + "  ▾")
             tag.setForeground(QColor("#146951"))
         if selected:
@@ -829,6 +852,7 @@ class FinanceDialog(QDialog):
     def open_article_filter(self, kind, category, account=None):
         self.article_filter = kind, category
         self.operation_account = account
+        self.pending_filter.setChecked(False)
         self.search.clear()
         self.tabs.setCurrentWidget(self.operation_page)
         self.refresh_operations()
@@ -836,6 +860,12 @@ class FinanceDialog(QDialog):
     def clear_article_filter(self):
         self.article_filter = None
         self.operation_account = None
+        self.refresh_operations()
+
+    def toggle_pending(self, checked):
+        if checked:
+            self.article_filter = None
+            self.operation_account = None
         self.refresh_operations()
 
     def open_graph(self, mode, *, subject=None):
@@ -933,6 +963,7 @@ class FinanceDialog(QDialog):
             return
         self.article_filter = None
         self.operation_account = None
+        self.pending_filter.setChecked(False)
         self.search.blockSignals(True)
         self.search.clear()
         self.search.blockSignals(False)
@@ -974,6 +1005,7 @@ class FinanceDialog(QDialog):
         self.edit_button.setEnabled(editable and one is not None)
         self.rule_button.setEnabled(editable and ordinary)
         self.tags_button.setEnabled(editable and bool(rows))
+        self.transfer_button.setEnabled(editable and one is not None and one.kind != "debt")
         self.debt_button.setEnabled(editable and ordinary and
                                     all(move.operation != one.number for move in self.catalog.funds.movements))
         self.operation_count.setText(f"Выбрано {len(rows)} из {len(self.filtered)}" if len(rows) > 1
@@ -983,7 +1015,20 @@ class FinanceDialog(QDialog):
         if not self.catalog.editable or selecting_rows():
             return
         row = self.filtered[index]
-        if column == self.ARTICLE and row.kind in ("income", "expense"):
+        if column == self.KIND and row.kind != "debt":
+            if row.kind == "transfer":
+                self.open_transfer(row.number)
+                return
+            item = self.operations.item(index, column)
+            point = self.operations.viewport().mapToGlobal(self.operations.visualItemRect(item).bottomLeft())
+            menu = QMenu(self)
+            current = menu.addAction(FLOW_LABELS[row.kind])
+            current.setCheckable(True)
+            current.setChecked(True)
+            convert = menu.addAction("Перевод между своими счетами…")
+            if menu.exec(point) == convert:
+                self.open_transfer(row.number)
+        elif column == self.ARTICLE and row.kind in ("income", "expense"):
             item = self.operations.item(index, column)
             point = self.operations.viewport().mapToGlobal(self.operations.visualItemRect(item).bottomLeft())
             self.set_article((row,), point)
@@ -991,7 +1036,7 @@ class FinanceDialog(QDialog):
             self.set_tags((row,))
 
     def operation_double_clicked(self, _, column):
-        if column not in (self.ARTICLE, self.TAGS):
+        if column not in (self.KIND, self.ARTICLE, self.TAGS):
             self.edit_operation()
 
     def set_article(self, rows, point):
@@ -1023,6 +1068,15 @@ class FinanceDialog(QDialog):
         if rows and self.catalog.editable:
             self.set_tags(rows)
 
+    def transfer_selected(self):
+        if self.transfer_button.isEnabled() and (row := self.selected_operation()) is not None:
+            self.open_transfer(row.number)
+
+    def open_transfer(self, number):
+        dialog = TransferDialog(self, self.catalog, number)
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            self.save_classification(dialog.result_review, self.catalog.directory)
+
     def save_classification(self, review, directory):
         if (review, directory) == (self.catalog.review, self.catalog.directory):
             return
@@ -1040,7 +1094,7 @@ class FinanceDialog(QDialog):
             self.tabs.setCurrentWidget(self.debt_panel)
             return
         if row.kind == "transfer":
-            self.open_review()
+            self.open_transfer(row.number)
             return
         if entry.source != "manual" or used:
             self.classify_operation()

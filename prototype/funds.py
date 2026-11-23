@@ -147,7 +147,7 @@ class Funds:
         commands = {}
         movements = set()
         used = {}
-        linked = review.fixed_operations
+        linked = review.reserved_operations
         for move in self.movements:
             fund = self.fund(move.fund)
             if type(move.amount) is not int or not move.amount or not isinstance(move.command, str) or not move.command:
