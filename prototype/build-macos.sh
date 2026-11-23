@@ -35,5 +35,5 @@ stage=$(mktemp -d)
 trap 'rm -rf "$stage"' EXIT
 ditto dist/FinanceArchive.app "$stage/FinanceArchive.app"
 pkgbuild --root "$stage" --install-location /Applications \
-    --identifier org.familyfinance.archive --version 1.1.0 \
+    --identifier org.familyfinance.archive --version 1.2.0 \
     dist/FinanceArchive.pkg

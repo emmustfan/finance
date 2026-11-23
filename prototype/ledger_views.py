@@ -1,4 +1,4 @@
-"""Account operations, CSV review and balance comparison."""
+"""Account operations, statement review and balance comparison."""
 
 from collections import Counter
 from pathlib import Path
@@ -11,9 +11,13 @@ from PySide6.QtWidgets import (
 
 from appearance import ChoiceBox, button, label
 from assets import Asset, amount_text, parse_amount
+from bank_pdf import read_pdf_statements
 from documents import Catalog
 from finance_editors import OperationEditor
-from ledger import Ledger, Opening, Statement, _normalized, preview_import, read_statement
+from ledger import (
+    Ledger, Opening, Statement, prepare_statement_account, preview_import,
+    read_statement, reference_matches,
+)
 
 FIELDS = {
     "date": "Дата", "amount": "Сумма со знаком", "description": "Описание",
@@ -88,16 +92,23 @@ class ImportDialog(QDialog):
         self.ledger = ledger
         self.accounts = accounts
         self.preview = None
+        self.preview_ledger = ledger
         self.result_ledger = ledger
         self.setWindowTitle("Импорт выписки")
         self.resize(890, 650)
         layout = QVBoxLayout(self)
         layout.setContentsMargins(20, 16, 20, 16)
-        layout.addWidget(label(statement.name, "screenTitle", wrap=True))
+        title = label(statement.name, "screenTitle", wrap=True)
+        title.setTextFormat(Qt.TextFormat.PlainText)
+        layout.addWidget(title)
+        is_pdf = statement.source == "pdf"
+        if is_pdf:
+            day, amount, currency, reference = statement.opening_hint
+            layout.addWidget(label(f"{statement.bank} · Счёт •{reference[-4:]} · {currency}", "muted"))
         if position is not None:
             number, total = position
             layout.addWidget(label(
-                f"Выписка {number} из {total}. Запись после подтверждения всех выбранных файлов.",
+                f"Счёт в выписке {number} из {total}. Запись после подтверждения всего импорта.",
                 "muted",
             ))
         self.account = ChoiceBox()
@@ -108,29 +119,30 @@ class ImportDialog(QDialog):
             self.account.addItem(details, number)
         layout.addWidget(self.account)
 
-        mapping = QHBoxLayout()
-        left, right = QFormLayout(), QFormLayout()
-        mapping.addLayout(left, 1)
-        mapping.addLayout(right, 1)
         self.columns = {}
-        suggested = statement.suggested_columns()
-        for index, (key, title) in enumerate(FIELDS.items()):
-            form = left if index < 5 else right
-            combo = ChoiceBox()
-            combo.setAccessibleName(title)
-            combo.addItem("Не выбрано", None)
-            for column, header in enumerate(statement.columns):
-                combo.addItem(f"{header or 'Столбец'} · {column + 1}", column)
-            if key in suggested:
-                combo.setCurrentIndex(combo.findData(suggested[key]))
-            self.columns[key] = combo
-            form.addRow(title, combo)
-        layout.addLayout(mapping)
-        reference = _normalized(statement.reference(suggested))
+        self.suggested = statement.suggested_columns()
+        if not is_pdf:
+            mapping = QHBoxLayout()
+            left, right = QFormLayout(), QFormLayout()
+            mapping.addLayout(left, 1)
+            mapping.addLayout(right, 1)
+            for index, (key, title) in enumerate(FIELDS.items()):
+                form = left if index < 5 else right
+                combo = ChoiceBox()
+                combo.setAccessibleName(title)
+                combo.addItem("Не выбрано", None)
+                for column, header in enumerate(statement.columns):
+                    combo.addItem(f"{header or 'Столбец'} · {column + 1}", column)
+                if key in self.suggested:
+                    combo.setCurrentIndex(combo.findData(self.suggested[key]))
+                self.columns[key] = combo
+                form.addRow(title, combo)
+            layout.addLayout(mapping)
+        reference = statement.reference(self.suggested)
         if reference:
             matches = [
                 opening.account for opening in ledger.openings
-                if opening.account in accounts and _normalized(opening.reference) == reference
+                if opening.account in accounts and reference_matches(reference, opening.reference)
             ]
             if len(matches) == 1:
                 self.account.setCurrentIndex(self.account.findData(matches[0]))
@@ -140,12 +152,15 @@ class ImportDialog(QDialog):
 
         preview_actions = QHBoxLayout()
         preview_actions.addWidget(button("Предпросмотр", self.build_preview))
-        self.summary = label("Выберите счёт и столбцы выписки.", "muted", wrap=True)
+        self.summary = label("Выберите счёт для выписки." if is_pdf else "Выберите счёт и столбцы выписки.",
+                             "muted", wrap=True)
         preview_actions.addWidget(self.summary, 1)
         layout.addLayout(preview_actions)
         self.grid = table(("Статус", "Строка", "Дата", "Сумма", "Описание / причина"), 4)
         self.grid.itemChanged.connect(lambda _: self.refresh_summary())
         layout.addWidget(self.grid, 1)
+        self.setup = label(style="muted", wrap=True)
+        layout.addWidget(self.setup)
         self.balance = label(style="muted", wrap=True)
         layout.addWidget(self.balance)
         actions = QHBoxLayout()
@@ -159,22 +174,32 @@ class ImportDialog(QDialog):
     def clear_preview(self) -> None:
         self.preview = None
         self.grid.setRowCount(0)
+        self.setup.clear()
         self.balance.clear()
         self.summary.setText("Настройки изменились. Постройте предпросмотр.")
         self.apply_button.setEnabled(False)
 
     def build_preview(self) -> None:
+        self.clear_preview()
         account = self.account.currentData()
         if account is None:
             self.summary.setText("Выберите счёт, к которому относится выписка.")
             return
-        mapping = {name: combo.currentData() for name, combo in self.columns.items() if combo.currentData() is not None}
+        mapping = self.suggested if self.statement.source == "pdf" else {
+            name: combo.currentData() for name, combo in self.columns.items() if combo.currentData() is not None
+        }
         try:
-            preview = preview_import(self.ledger, account, self.statement, mapping)
+            staged = prepare_statement_account(self.ledger, self.accounts[account], self.statement)
+            preview = preview_import(staged, account, self.statement, mapping)
         except ValueError as exc:
             self.summary.setText(str(exc))
             return
         self.preview = preview
+        self.preview_ledger = staged
+        if self.statement.source == "pdf" and self.ledger.opening(account) is None:
+            opening = staged.opening(account)
+            self.setup.setText(f"Начальный остаток из PDF на {opening.day} · "
+                               f"{amount_text(opening.amount)} {opening.currency}.")
         self.grid.blockSignals(True)
         self.grid.setRowCount(len(preview.rows))
         for index, row in enumerate(preview.rows):
@@ -193,7 +218,10 @@ class ImportDialog(QDialog):
                     item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
                 self.grid.setItem(index, column, item)
         self.grid.blockSignals(False)
-        self.apply_button.setEnabled(True)
+        has_errors = any(row.state == "error" for row in preview.rows)
+        self.apply_button.setEnabled(self.statement.source != "pdf" or not has_errors)
+        if self.statement.source == "pdf" and has_errors:
+            self.setup.setText("Исправьте ошибки в строках перед импортом PDF. Проверьте выбранный счёт и дату остатка.")
         self.refresh_summary()
 
     def confirmed_lines(self) -> set[int]:
@@ -213,7 +241,7 @@ class ImportDialog(QDialog):
         )
         check = self.preview.balance
         if check is not None:
-            staged = self.preview.apply(self.ledger, confirmed)
+            staged = self.preview.apply(self.preview_ledger, confirmed)
             self.balance.setText(
                 comparison(staged.balance_on(check.account, check.day), check.amount, check.day,
                            self.accounts[check.account].currency)
@@ -228,13 +256,15 @@ class ImportDialog(QDialog):
     def apply(self) -> None:
         if self.preview is not None:
             if any(row.state == "error" for row in self.preview.rows):
+                if self.statement.source == "pdf":
+                    return
                 reply = QMessageBox.question(
                     self, "В выписке есть ошибки",
                     "Импортировать допустимые строки? Чтобы исправить ошибки в настройках, нажмите «Нет».",
                 )
                 if reply != QMessageBox.StandardButton.Yes:
                     return
-            self.result_ledger = self.preview.apply(self.ledger, self.confirmed_lines())
+            self.result_ledger = self.preview.apply(self.preview_ledger, self.confirmed_lines())
             self.accept()
 
 
@@ -257,7 +287,7 @@ class LedgerDialog(QDialog):
         actions = QHBoxLayout()
         self.opening_button = button("Начальный остаток…", self.set_opening)
         self.manual_button = button("+ Операция", self.add_manual)
-        self.import_button = button("Импорт CSV…", self.import_files, primary=True)
+        self.import_button = button("Импорт PDF и CSV…", self.import_files, primary=True)
         self.check_button = button("Сверить остаток…", self.reconcile)
         for widget in (self.opening_button, self.manual_button, self.import_button, self.check_button):
             actions.addWidget(widget)
@@ -280,7 +310,7 @@ class LedgerDialog(QDialog):
         number = self.account.currentData()
         ledger = self.catalog.ledger
         self.opening_button.setEnabled(number is not None and self.catalog.editable)
-        self.import_button.setEnabled(bool(ledger.openings) and self.catalog.editable)
+        self.import_button.setEnabled(bool(self.accounts) and self.catalog.editable)
         latest = ledger.latest_balance(number)
         self.manual_button.setEnabled(number is not None and self.accounts[number].status == "active"
                                       and self.catalog.editable)
@@ -291,7 +321,7 @@ class LedgerDialog(QDialog):
             self.summary.setText("Добавьте банковский счёт в разделе «Счета и активы».")
             return
         if latest is None:
-            self.summary.setText("Добавьте первую операцию. Начальный остаток можно указать в той же форме.")
+            self.summary.setText("Добавьте первую операцию или импортируйте PDF. В PDF начальный остаток берётся из выписки.")
             return
         amount, day = latest
         currency = self.accounts[number].currency
@@ -306,7 +336,7 @@ class LedgerDialog(QDialog):
                          key=lambda item: item.day, reverse=True)
         self.grid.setRowCount(len(entries))
         for row, entry in enumerate(entries):
-            source = "CSV" if entry.source == "csv" else "Вручную"
+            source = {"csv": "CSV", "pdf": "PDF"}.get(entry.source, "Вручную")
             for column, value in enumerate((entry.day, amount_text(entry.amount), entry.description, source)):
                 item = QTableWidgetItem(value)
                 if column == 1:
@@ -330,7 +360,7 @@ class LedgerDialog(QDialog):
         initial = self.catalog.ledger.opening(number)
         known_amount = initial.amount if initial else asset.amount
         values = DetailsDialog(self, "Начальный остаток",
-            "Укажите остаток на конец дня перед первой операцией. Реквизит сверяется со столбцом «Счёт» в CSV.",
+            "Укажите остаток на конец дня перед первой операцией. Реквизит сверяется со счётом в выписке.",
             (
                 ("day", "Дата", initial.day if initial else asset.as_of, "ГГГГ-ММ-ДД"),
                 ("amount", f"Остаток, {asset.currency}", amount_text(known_amount) if known_amount is not None else "", "0,00"),
@@ -381,18 +411,34 @@ class LedgerDialog(QDialog):
             self.error(exc)
 
     def import_files(self) -> None:
-        files, _ = QFileDialog.getOpenFileNames(self, "Выберите выписки", "", "Выписки CSV (*.csv)")
+        files, _ = QFileDialog.getOpenFileNames(self, "Выберите выписки", "", "Выписки (*.pdf *.csv)")
         if not files:
             return
+        statements = []
+        try:
+            for filename in files:
+                path = Path(filename)
+                if path.suffix.lower() == ".pdf":
+                    statements.extend(read_pdf_statements(path))
+                else:
+                    statements.append(read_statement(path))
+        except (OSError, ValueError) as exc:
+            self.error(exc)
+            return
+        statements.sort(key=lambda item: item.opening_hint[0] if item.opening_hint else "9999")
         staged = self.catalog.ledger
-        accounts = {number: asset for number, asset in self.accounts.items() if staged.opening(number)}
-        for index, filename in enumerate(files, start=1):
-            try:
-                statement = read_statement(Path(filename))
-            except (OSError, ValueError) as exc:
-                self.error(exc)
+        for index, statement in enumerate(statements, start=1):
+            if statement.opening_hint:
+                currency = statement.opening_hint[2]
+                accounts = {number: asset for number, asset in self.accounts.items() if asset.currency == currency}
+                message = f"Добавьте счёт в валюте {currency} в разделе «Счета и активы»."
+            else:
+                accounts = {number: asset for number, asset in self.accounts.items() if staged.opening(number)}
+                message = "Задайте начальный остаток счёта перед импортом CSV."
+            if not accounts:
+                self.error(ValueError(message))
                 return
-            position = (index, len(files)) if len(files) > 1 else None
+            position = (index, len(statements)) if len(statements) > 1 else None
             dialog = ImportDialog(self, statement, staged, accounts, position=position)
             if dialog.exec() != QDialog.DialogCode.Accepted:
                 return

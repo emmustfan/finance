@@ -1,4 +1,4 @@
-"""Exact-cent account ledger, CSV preview and balance reconciliation."""
+"""Exact-cent account ledger, statement preview and balance reconciliation."""
 
 import csv
 import hashlib
@@ -141,7 +141,7 @@ class Ledger:
                 or _day(entry.day) <= openings[entry.account].day
                 or type(entry.amount) is not int or not entry.amount
                 or not isinstance(entry.description, str) or not entry.description.strip()
-                or entry.source not in ("manual", "csv")
+                or entry.source not in ("manual", "csv", "pdf")
                 or not all(isinstance(value, str) for value in (entry.external_id, entry.recipient,
                                                                entry.bank_category, entry.counterparty))
             ):
@@ -202,6 +202,10 @@ class Statement:
     digest: str
     columns: tuple[str, ...]
     rows: tuple[tuple[int, tuple[str, ...]], ...]
+    source: str = "csv"
+    bank: str = ""
+    opening_hint: tuple[str, int, str, str] | None = None
+    closing_hint: tuple[str, int] | None = None
 
     def suggested_columns(self) -> dict[str, int]:
         normalized = [_normalized(column) for column in self.columns]
@@ -251,6 +255,38 @@ def read_statement(path: Path) -> Statement:
     if not rows:
         raise ValueError("В выписке нет строк с операциями.")
     return Statement(path.name, hashlib.sha256(raw).hexdigest(), tuple(header), tuple(rows))
+
+
+def reference_matches(candidate: str, known: str) -> bool:
+    left, right = _normalized(candidate), _normalized(known)
+    if not left or not right:
+        return False
+    if left == right:
+        return True
+    for masked, full in ((left, right), (right, left)):
+        match = re.fullmatch(r"([0-9]{6})\*+([0-9]{4})", masked)
+        if match and re.fullmatch(r"[0-9]{20}", full):
+            return full.startswith(match[1]) and full.endswith(match[2])
+    return False
+
+
+def prepare_statement_account(ledger: Ledger, asset: Asset, statement: Statement) -> Ledger:
+    if statement.opening_hint is None:
+        return ledger
+    day, amount, currency, reference = statement.opening_hint
+    if asset.currency != currency:
+        raise ValueError("Валюта выписки отличается от валюты выбранного счёта.")
+    opening = ledger.opening(asset.asset_number)
+    if opening is not None and opening.reference and not reference_matches(reference, opening.reference):
+        raise ValueError("Реквизит в выписке отличается от реквизита выбранного счёта.")
+    if any(item.account != asset.asset_number and reference_matches(reference, item.reference)
+           for item in ledger.openings):
+        raise ValueError("Этот реквизит уже привязан к другому счёту архива.")
+    if opening is None:
+        return ledger.set_opening(Opening(asset.asset_number, day, amount, currency, reference))
+    if not opening.reference:
+        return ledger.set_opening(replace(opening, reference=reference))
+    return ledger
 
 
 @dataclass(frozen=True)
@@ -310,7 +346,7 @@ def preview_import(ledger: Ledger, account: int, statement: Statement, mapping: 
         seen_refs = {_normalized(values[column]) for _, values in statement.rows if column < len(values) and values[column]}
     if len(seen_refs) > 1:
         raise ValueError("В файле несколько реквизитов счёта. Разделите его на отдельные выписки.")
-    if seen_refs and opening.reference and _normalized(opening.reference) not in seen_refs:
+    if seen_refs and opening.reference and not any(reference_matches(value, opening.reference) for value in seen_refs):
         raise ValueError("Реквизит в выписке отличается от реквизита выбранного счёта.")
     rows, reported = [], []
     for line, values in statement.rows:
@@ -325,7 +361,7 @@ def preview_import(ledger: Ledger, account: int, statement: Statement, mapping: 
             if cells.get("currency") and cells["currency"].upper() != opening.currency:
                 raise ValueError("Валюта операции отличается от валюты счёта.")
             external_id = cells.get("identifier", "")
-            entry = Entry(account, day, amount, cells["description"], external_id, "csv",
+            entry = Entry(account, day, amount, cells["description"], external_id, statement.source,
                           cells.get("recipient", ""), cells.get("bank_category", ""), cells.get("counterparty", ""))
             balance = parse_amount(cells.get("balance", ""))
         except (ValueError, IndexError) as exc:
@@ -352,7 +388,10 @@ def preview_import(ledger: Ledger, account: int, statement: Statement, mapping: 
         if balance is not None:
             reported.append((day, balance))
     bank, warning = None, ""
-    if reported:
+    if statement.closing_hint is not None and statement.closing_hint[0] >= opening.day:
+        day, amount = statement.closing_hint
+        bank = BankBalance(account, day, amount)
+    elif reported:
         last_day = max(day for day, _ in reported)
         amounts = {amount for day, amount in reported if day == last_day}
         if len(amounts) == 1:
