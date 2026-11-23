@@ -1,0 +1,82 @@
+name: macOS family access
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'finance-share-test-*'
+
+permissions:
+  contents: read
+
+jobs:
+  access:
+    runs-on: macos-15
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Exercise an archive with two macOS users
+        run: |
+          set -euo pipefail
+          qa="$(mktemp -d /Users/Shared/FinanceArchiveQA.XXXXXX)"
+          chmod 0755 "$qa"
+          trap 'sudo rm -rf "$qa"' EXIT
+          python="$(command -v python3.12)"
+          mkdir "$qa/source"
+          cp prototype/*.py "$qa/source"
+          "$python" -m pip install --only-binary=:all: --target "$qa/deps" \
+            cryptography==48.0.1 Pillow==13.0.0
+          sudo dseditgroup -o create -i 4510 financearchiveqa
+          for entry in _financeqaa:4511 _financeqab:4512; do
+            user="${entry%:*}"
+            number="${entry#*:}"
+            sudo dscl . -create "/Users/$user"
+            sudo dscl . -create "/Users/$user" UniqueID "$number"
+            sudo dscl . -create "/Users/$user" PrimaryGroupID 20
+            sudo dscl . -create "/Users/$user" UserShell /usr/bin/false
+            sudo dscl . -create "/Users/$user" NFSHomeDirectory "$qa/$user"
+            sudo install -d -o "$user" -g staff -m 0700 "$qa/$user"
+            sudo dseditgroup -o edit -a "$user" -t user financearchiveqa
+            sudo -u "$user" id -G | tr ' ' '\n' | grep -qx 4510
+          done
+          sudo install -d -o root -g financearchiveqa -m 0770 "$qa/shared"
+          run_as() {
+            sudo -u "$1" env PYTHONPATH="$qa/source:$qa/deps" "$python" - "$qa"
+          }
+          run_as _financeqaa <<'PY'
+          from pathlib import Path
+          import sys
+          from documents import Card, Catalog
+          root = Path(sys.argv[1])
+          family = Catalog.create(root / "shared/family.fvault", "fictional shared password", scope="family")
+          family.add(Card("Первый документ", folder="01"))
+          Catalog.create(root / "_financeqaa/personal.fvault", "fictional personal password", scope="personal")
+          Catalog.create(root / "_financeqaa/business.fvault", "fictional business password", scope="business")
+          PY
+          run_as _financeqab <<'PY'
+          from pathlib import Path
+          import sys
+          from documents import Card, Catalog
+          root = Path(sys.argv[1])
+          family = Catalog.open(root / "shared/family.fvault", "fictional shared password")
+          assert family.editable and len(family.cards) == 1
+          family.add(Card("Второй документ", folder="01"))
+          for name in ("personal", "business"):
+              try:
+                  Catalog.open(root / f"_financeqaa/{name}.fvault", f"fictional {name} password")
+              except PermissionError:
+                  pass
+              else:
+                  raise AssertionError(f"{name} archive was accessible to another user")
+          PY
+          run_as _financeqaa <<'PY'
+          from pathlib import Path
+          import sys
+          from documents import Card, Catalog
+          root = Path(sys.argv[1])
+          family = Catalog.open(root / "shared/family.fvault", "fictional shared password")
+          assert family.editable and [card.title for card in family.cards] == ["Первый документ", "Второй документ"]
+          family.add(Card("Третий документ", folder="01"))
+          PY
