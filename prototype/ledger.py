@@ -20,6 +20,9 @@ ALIASES = {
     "identifier": ("operation id", "transaction id", "id", "id операции", "идентификатор операции"),
     "currency": ("currency", "валюта", "валюта операции", "валюта платежа"),
     "account": ("account", "account number", "счёт", "счет", "номер счета", "номер счёта"),
+    "recipient": ("recipient", "payee", "получатель", "контрагент"),
+    "bank_category": ("category", "категория", "категория банка"),
+    "counterparty": ("counterparty account", "счёт контрагента", "счет контрагента", "реквизит получателя"),
     "balance": ("balance", "остаток", "баланс", "остаток после операции", "остаток на счете"),
 }
 NEEDED = ("date", "amount", "description")
@@ -73,6 +76,9 @@ class Entry:
     description: str
     external_id: str = ""
     source: str = "manual"
+    recipient: str = ""
+    bank_category: str = ""
+    counterparty: str = ""
 
     @property
     def fingerprint(self) -> tuple[str, int, str]:
@@ -129,7 +135,9 @@ class Ledger:
                 or _day(entry.day) <= openings[entry.account].day
                 or type(entry.amount) is not int or not entry.amount
                 or not isinstance(entry.description, str) or not entry.description.strip()
-                or not isinstance(entry.external_id, str) or entry.source not in ("manual", "csv")
+                or entry.source not in ("manual", "csv")
+                or not all(isinstance(value, str) for value in (entry.external_id, entry.recipient,
+                                                               entry.bank_category, entry.counterparty))
             ):
                 raise ValueError("Операция должна иметь сумму, описание и дату после начального остатка.")
             if entry.external_id:
@@ -311,7 +319,8 @@ def preview_import(ledger: Ledger, account: int, statement: Statement, mapping: 
             if cells.get("currency") and cells["currency"].upper() != opening.currency:
                 raise ValueError("Валюта операции отличается от валюты счёта.")
             external_id = cells.get("identifier", "")
-            entry = Entry(account, day, amount, cells["description"], external_id, "csv")
+            entry = Entry(account, day, amount, cells["description"], external_id, "csv",
+                          cells.get("recipient", ""), cells.get("bank_category", ""), cells.get("counterparty", ""))
             balance = parse_amount(cells.get("balance", ""))
         except (ValueError, IndexError) as exc:
             reason = str(exc) if isinstance(exc, ValueError) else "Не хватает столбцов."

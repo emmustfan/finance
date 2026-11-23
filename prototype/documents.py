@@ -15,10 +15,12 @@ from pathlib import Path
 from PIL import Image, ImageOps
 
 from assets import Asset, validate_assets
+from funds import Funds
 from ledger import Ledger
+from review import Review
 from vault import (
     DOCUMENT_MAGIC, MAGIC, MAX_DOCUMENT_DATA, MAX_PDF, UnlockedVault, _check_pdf,
-    _write_new, read_container,
+    _write_new, configure_group, group_for_directory, read_container,
 )
 
 CARD_FIELDS = (
@@ -27,6 +29,8 @@ CARD_FIELDS = (
     ("tags", "Теги"), ("note", "Примечание"), ("cabinet", "Шкаф или место хранения"),
     ("folder", "Папка"), ("section", "Раздел"), ("position", "Номер в папке"),
 )
+
+SCOPES = {"family": "Семейный", "personal": "Личный", "business": "ИП", "legacy": "Архив"}
 
 DEFAULT_KINDS = (
     "Паспорт", "Свидетельство", "Удостоверение", "Водительские права",
@@ -141,7 +145,10 @@ def read_pdf(path: Path) -> bytes:
     return pdf
 
 
-def _encode_catalog(cards: tuple[Card, ...], assets: tuple[Asset, ...], ledger: Ledger) -> bytes:
+def _encode_catalog(
+    cards: tuple[Card, ...], assets: tuple[Asset, ...], ledger: Ledger,
+    review: Review, funds: Funds, scope: str,
+) -> bytes:
     attachment_bytes = sum(
         len(card.pdf or b"") + sum(len(photo.data) for photo in card.photos) for card in cards
     )
@@ -163,26 +170,47 @@ def _encode_catalog(cards: tuple[Card, ...], assets: tuple[Asset, ...], ledger: 
         items.append(item)
     validate_assets(assets, {card.archive_number for card in cards})
     ledger.validate(assets)
+    if scope not in SCOPES:
+        raise ValueError("Неизвестная область архива.")
+    review.validate(ledger, assets, scope)
+    funds.validate(ledger, review)
     content = items
-    if assets:
+    if assets or scope != "legacy" or review != Review() or funds != Funds():
         content = {"cards": items, "assets": [asdict(asset) for asset in assets]}
         if ledger.openings:
             content["ledger"] = ledger.to_payload()
+        if review != Review():
+            content["review"] = review.to_payload()
+        if funds != Funds():
+            content["funds"] = funds.to_payload()
+        if scope != "legacy":
+            content["scope"] = scope
     payload = json.dumps(content, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
     if len(payload) > MAX_DOCUMENT_DATA:
         raise ValueError("Архив превысил лимит 64 МиБ. Создайте отдельный архив.")
     return payload
 
 
-def decode_catalog(payload: bytes) -> tuple[tuple[Card, ...], tuple[Asset, ...], Ledger]:
+def decode_catalog(
+    payload: bytes,
+) -> tuple[tuple[Card, ...], tuple[Asset, ...], Ledger, Review, Funds, str]:
     try:
         content = json.loads(payload)
         assets = []
         ledger = Ledger()
-        if isinstance(content, dict) and set(content) - {"ledger"} == {"cards", "assets"}:
+        review, funds, scope = Review(), Funds(), "legacy"
+        optional_sections = {"ledger", "review", "funds", "scope"}
+        if isinstance(content, dict) and set(content) - optional_sections == {"cards", "assets"}:
             items = content["cards"]
             if "ledger" in content:
                 ledger = Ledger.from_payload(content["ledger"])
+            if "review" in content:
+                review = Review.from_payload(content["review"])
+            if "funds" in content:
+                funds = Funds.from_payload(content["funds"])
+            scope = content.get("scope", "legacy")
+            if scope not in SCOPES:
+                raise ValueError("Неизвестная область архива.")
             if not isinstance(content["assets"], list):
                 raise ValueError("Ожидается список активов.")
             for item in content["assets"]:
@@ -220,7 +248,9 @@ def decode_catalog(payload: bytes) -> tuple[tuple[Card, ...], tuple[Asset, ...],
             cards.append(card)
         validate_assets(tuple(assets), numbers)
         ledger.validate(tuple(assets))
-        return tuple(cards), tuple(assets), ledger
+        review.validate(ledger, tuple(assets), scope)
+        funds.validate(ledger, review)
+        return tuple(cards), tuple(assets), ledger, review, funds, scope
     except (ValueError, TypeError, KeyError, UnicodeError) as exc:
         raise ValueError("Не удалось прочитать карточки архива.") from exc
 
@@ -240,6 +270,9 @@ class Catalog:
     _unlocked: UnlockedVault = field(repr=False, compare=False)
     assets: tuple[Asset, ...] = ()
     ledger: Ledger = Ledger()
+    review: Review = Review()
+    funds: Funds = Funds()
+    scope: str = "legacy"
 
     @classmethod
     def open(cls, path: Path, password: str) -> "Catalog":
@@ -247,23 +280,27 @@ class Catalog:
         data = read_container(path)
         unlocked, magic, payload = UnlockedVault.open(data, password)
         if magic == MAGIC:
-            cards, assets, ledger = (Card("Тестовый документ", pdf=payload, archive_number=1),), (), Ledger()
-        else:
-            cards, assets, ledger = decode_catalog(payload)
-        return cls(path, cards, hashlib.sha256(data).digest(), unlocked, assets, ledger)
+            return cls(path, (Card("Тестовый документ", pdf=payload, archive_number=1),),
+                       hashlib.sha256(data).digest(), unlocked)
+        cards, assets, ledger, review, funds, scope = decode_catalog(payload)
+        if scope in ("personal", "business") and path.stat().st_uid != os.getuid():
+            raise ValueError("Личный архив и архив ИП открываются из учётной записи владельца.")
+        return cls(path, cards, hashlib.sha256(data).digest(), unlocked, assets, ledger, review, funds, scope)
 
     @classmethod
     def create(
         cls, path: Path, password: str, *, cards: tuple[Card, ...] = (),
         assets: tuple[Asset, ...] = (), ledger: Ledger = Ledger(),
+        review: Review = Review(), funds: Funds = Funds(), scope: str = "legacy",
     ) -> "Catalog":
         path = path.parent.resolve() / path.name
         cards = tuple(replace(card, archive_number=index) for index, card in enumerate(cards, start=1))
         unlocked = UnlockedVault.create(password)
         assets = tuple(replace(asset, asset_number=index) for index, asset in enumerate(assets, start=1))
-        data = unlocked.encrypt(_encode_catalog(cards, assets, ledger), DOCUMENT_MAGIC)
-        _write_new(path, data)
-        return cls(path, cards, hashlib.sha256(data).digest(), unlocked, assets, ledger)
+        data = unlocked.encrypt(_encode_catalog(cards, assets, ledger, review, funds, scope), DOCUMENT_MAGIC)
+        group = group_for_directory(path) if scope == "family" else None
+        _write_new(path, data, group=group)
+        return cls(path, cards, hashlib.sha256(data).digest(), unlocked, assets, ledger, review, funds, scope)
 
     def add(self, card: Card) -> "Catalog":
         number = max((existing.archive_number for existing in self.cards), default=0) + 1
@@ -334,6 +371,21 @@ class Catalog:
     def save_ledger(self, ledger: Ledger) -> "Catalog":
         return self._save(self.cards, self.assets, ledger)
 
+    def save_review(self, review: Review) -> "Catalog":
+        return self._save(self.cards, self.assets, review=review)
+
+    def save_funds(self, funds: Funds) -> "Catalog":
+        return self._save(self.cards, self.assets, funds=funds)
+
+    def liquid_totals(self) -> dict[str, int]:
+        totals = {}
+        for asset in self.assets:
+            if asset.category == "account" and asset.status == "active":
+                amount = self.recorded_value(asset).amount
+                if amount is not None:
+                    totals[asset.currency] = totals.get(asset.currency, 0) + amount
+        return totals
+
     def _read_current(self) -> bytes:
         data = read_container(self.path)
         if hashlib.sha256(data).digest() != self.revision:
@@ -349,34 +401,66 @@ class Catalog:
             mode = self.path.lstat()
         except OSError:
             return False
+        if not stat.S_ISREG(mode.st_mode):
+            return False
+        try:
+            if self.shared_group is not None:
+                return os.access(self.path, os.R_OK | os.W_OK)
+        except OSError:
+            return False
         return (
-            stat.S_ISREG(mode.st_mode)
-            and mode.st_uid == os.getuid()
+            mode.st_uid == os.getuid()
             and bool(mode.st_mode & stat.S_IWUSR)
             and not mode.st_mode & 0o077
             and os.access(self.path.parent, os.W_OK | os.X_OK)
         )
 
+    @property
+    def shared_group(self) -> int | None:
+        if self.scope != "family":
+            return None
+        mode = self.path.lstat()
+        group = group_for_directory(self.path)
+        return group if group == mode.st_gid and stat.S_IMODE(mode.st_mode) == 0o660 else None
+
     def _check_editable(self) -> None:
         if not self.editable:
-            raise ValueError("Для изменения нужен архив владельца с приватными правами доступа.")
+            raise ValueError("Для изменения нужен архив владельца с приватными правами доступа или семейный архив с доступом группы.")
 
     def _save(
-        self, cards: tuple[Card, ...], assets: tuple[Asset, ...], ledger: Ledger | None = None
+        self, cards: tuple[Card, ...], assets: tuple[Asset, ...], ledger: Ledger | None = None,
+        *, review: Review | None = None, funds: Funds | None = None,
     ) -> "Catalog":
         self._check_editable()
         ledger = self.ledger if ledger is None else ledger
-        payload = _encode_catalog(cards, assets, ledger)
+        review = self.review if review is None else review
+        funds = self.funds if funds is None else funds
+        payload = _encode_catalog(cards, assets, ledger, review, funds, self.scope)
+        group = self.shared_group
         lock_path = self.path.with_name(f".{self.path.name}.lock")
-        fd = os.open(lock_path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+        flags = os.O_RDWR | os.O_NOFOLLOW
+        try:
+            fd = os.open(lock_path, flags | os.O_CREAT | os.O_EXCL, 0o600)
+        except FileExistsError:
+            fd = os.open(lock_path, flags)
+        else:
+            try:
+                configure_group(fd, group)
+            except OSError:
+                os.close(fd)
+                lock_path.unlink(missing_ok=True)
+                raise
         with os.fdopen(fd, "rb+") as lock:
             fcntl.flock(lock, fcntl.LOCK_EX)
             self._check_editable()
+            if self.shared_group != group:
+                raise ValueError("Права семейного архива изменились. Откройте его заново.")
             self._read_current()
             data = self._unlocked.encrypt(payload, DOCUMENT_MAGIC)
             with tempfile.NamedTemporaryFile(dir=self.path.parent, delete=False) as stream:
                 temporary = Path(stream.name)
                 try:
+                    configure_group(stream.fileno(), group)
                     stream.write(data)
                     stream.flush()
                     os.fsync(stream.fileno())
@@ -384,4 +468,5 @@ class Catalog:
                     os.replace(temporary, self.path)
                 finally:
                     temporary.unlink(missing_ok=True)
-        return replace(self, cards=cards, assets=assets, ledger=ledger, revision=hashlib.sha256(data).digest())
+        return replace(self, cards=cards, assets=assets, ledger=ledger, review=review, funds=funds,
+                       revision=hashlib.sha256(data).digest())

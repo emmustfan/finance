@@ -330,16 +330,20 @@ class RegistryDialog(QDialog):
             self.accept()
 
     def open_keepass(self) -> None:
-        try:
-            if sys.platform != "darwin":
-                raise OSError("Кнопка запуска KeePassXC предназначена для macOS.")
-            subprocess.run(
-                ["/usr/bin/open", "-a", "KeePassXC"], capture_output=True, check=True, timeout=10,
-            )
-        except subprocess.CalledProcessError:
-            QMessageBox.warning(
-                self, "Не удалось открыть KeePassXC",
-                "Проверьте, установлен ли KeePassXC. Указатель на запись можно скопировать из карточки.",
-            )
-        except (OSError, subprocess.TimeoutExpired) as exc:
-            QMessageBox.warning(self, "Не удалось открыть KeePassXC", str(exc))
+        launch_keepass(self)
+
+
+def launch_keepass(parent) -> None:
+    try:
+        if sys.platform != "darwin":
+            raise OSError("Кнопка запуска KeePassXC предназначена для macOS.")
+        subprocess.run(
+            ["/usr/bin/open", "-a", "KeePassXC"], capture_output=True, check=True, timeout=10,
+        )
+    except subprocess.CalledProcessError:
+        QMessageBox.warning(
+            parent, "Не удалось открыть KeePassXC",
+            "Проверьте, установлен ли KeePassXC. Указатель на запись можно скопировать из карточки.",
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        QMessageBox.warning(parent, "Не удалось открыть KeePassXC", str(exc))

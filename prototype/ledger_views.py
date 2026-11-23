@@ -18,7 +18,8 @@ from ledger import Entry, Ledger, Opening, Statement, _normalized, preview_impor
 FIELDS = {
     "date": "Дата", "amount": "Сумма со знаком", "description": "Описание",
     "identifier": "ID операции", "currency": "Валюта", "account": "Реквизит счёта",
-    "balance": "Остаток банка",
+    "balance": "Остаток банка", "recipient": "Получатель",
+    "bank_category": "Категория банка", "counterparty": "Счёт контрагента",
 }
 STATES = {"new": "Новая", "duplicate": "Повтор", "review": "На сверку", "error": "Ошибка"}
 
@@ -114,7 +115,7 @@ class ImportDialog(QDialog):
         self.columns = {}
         suggested = statement.suggested_columns()
         for index, (key, title) in enumerate(FIELDS.items()):
-            form = left if index < 3 else right
+            form = left if index < 5 else right
             combo = ChoiceBox()
             combo.setAccessibleName(title)
             combo.addItem("Не выбрано", None)
@@ -356,6 +357,7 @@ class LedgerDialog(QDialog):
                 ("day", "Дата", date.today().isoformat(), "ГГГГ-ММ-ДД"),
                 ("amount", "Сумма", "", "−300,00"),
                 ("description", "Описание", "", "Например, покупка продуктов"),
+                ("recipient", "Получатель", "", "Необязательно"),
             ),
         ).values()
         if values is None:
@@ -364,7 +366,9 @@ class LedgerDialog(QDialog):
             amount = parse_amount(values["amount"])
             if not amount:
                 raise ValueError("Укажите ненулевую сумму.")
-            self.save(self.catalog.ledger.add_manual(Entry(number, values["day"], amount, values["description"])))
+            self.save(self.catalog.ledger.add_manual(
+                Entry(number, values["day"], amount, values["description"], recipient=values["recipient"])
+            ))
         except ValueError as exc:
             self.error(exc)
 

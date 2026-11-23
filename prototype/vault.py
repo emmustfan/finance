@@ -29,10 +29,28 @@ def _check_pdf(pdf: bytes) -> None:
         raise ValueError("Ожидается PDF размером до 20 МиБ.")
 
 
-def _write_new(path: Path, data: bytes) -> None:
+def group_for_directory(path: Path) -> int | None:
+    directory = path.parent.stat()
+    groups = {os.getgid(), *os.getgroups()}
+    return directory.st_gid if (
+        directory.st_mode & 0o077 == 0o070
+        and directory.st_gid in groups
+        and os.access(path.parent, os.W_OK | os.X_OK)
+    ) else None
+
+
+def configure_group(fd: int, group: int | None) -> None:
+    if group is not None:
+        if os.fstat(fd).st_gid != group:
+            os.fchown(fd, -1, group)
+        os.fchmod(fd, 0o660)
+
+
+def _write_new(path: Path, data: bytes, *, group: int | None = None) -> None:
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     try:
         with os.fdopen(fd, "wb") as stream:
+            configure_group(stream.fileno(), group)
             stream.write(data)
             stream.flush()
             os.fsync(stream.fileno())
@@ -100,11 +118,18 @@ def open_pdf(path: Path, password: str) -> bytes:
     return payload
 
 
-def copy_verified(source: Path, destination: Path, password: str) -> None:
+def copy_verified(
+    source: Path, destination: Path, password: str, *, restore_shared: bool = False
+) -> None:
     """Authenticate the exact bytes to be copied, without replacing existing files."""
     data = read_container(source)
     magic, payload = decrypt(data, password)
+    group = None
     if magic == DOCUMENT_MAGIC:
         from documents import decode_catalog
-        decode_catalog(payload)
-    _write_new(destination, data)
+        *_, scope = decode_catalog(payload)
+        if scope in ("personal", "business") and source.stat().st_uid != os.getuid():
+            raise ValueError("Личный архив и архив ИП восстанавливает владелец файла.")
+        if restore_shared and scope == "family":
+            group = group_for_directory(destination)
+    _write_new(destination, data, group=group)

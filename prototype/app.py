@@ -22,11 +22,15 @@ from PIL.ImageQt import ImageQt
 from PIL import Image
 
 from appearance import ChoiceBox, TagEditor, TagFlow, apply_style, area, button, clear_tags, frame, label, tag_button
-from asset_views import RegistryDialog
+from asset_views import RegistryDialog, launch_keepass
 from assets import Asset
-from documents import CARD_FIELDS, MAX_ATTACHMENT_BYTES, Card, Catalog, Photo, read_pdf, read_photo, tag_names
+from documents import CARD_FIELDS, MAX_ATTACHMENT_BYTES, SCOPES, Card, Catalog, Photo, read_pdf, read_photo, tag_names
+from fund_views import FundsDialog, OverviewDialog
+from funds import Fund, Funds, Line, Template
 from ledger import Ledger, Opening
 from ledger_views import LedgerDialog
+from review import Recurring, Review
+from review_views import ReviewDialog
 from sample import sample_pdf
 from vault import copy_verified
 
@@ -613,12 +617,18 @@ class ArchiveWindow(QMainWindow):
         layout.addWidget(self.archive_hint)
         layout.addWidget(button("Открыть архив…", self.open_archive, sidebar=True))
         layout.addWidget(button("Новый архив…", lambda: self.create_archive(False), sidebar=True))
+        self.overview_button = button("Обзор…", self.open_overview, sidebar=True)
+        layout.addWidget(self.overview_button)
         self.folders_button = button("Бумажные папки…", self.open_folders, sidebar=True)
         layout.addWidget(self.folders_button)
         self.assets_button = button("Счета и активы…", self.open_registry, sidebar=True)
         layout.addWidget(self.assets_button)
         self.operations_button = button("Выписки и операции…", self.open_operations, sidebar=True)
         layout.addWidget(self.operations_button)
+        self.review_button = button("Разбор операций…", self.open_review, sidebar=True)
+        layout.addWidget(self.review_button)
+        self.funds_button = button("Фонды и цели…", self.open_funds, sidebar=True)
+        layout.addWidget(self.funds_button)
         layout.addSpacing(12)
         layout.addWidget(label("ТЕГИ", "sideSection"))
         self.all_documents = button("Все документы", lambda: self.set_tag(""), sidebar=True)
@@ -637,10 +647,13 @@ class ArchiveWindow(QMainWindow):
         self.manage.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
         self.manage.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         menu = QMenu(self.manage)
+        menu.addAction("Открыть KeePassXC", lambda: launch_keepass(self))
+        menu.addSeparator()
         menu.addAction("Создать копию…", lambda: self.copy_archive(False))
         menu.addAction("Восстановить из копии…", lambda: self.copy_archive(True))
         menu.addSeparator()
         menu.addAction("Создать тестовый архив…", lambda: self.create_archive(True))
+        menu.addAction("Создать тест фондов…", lambda: self.create_archive(True, funds_demo=True))
         self.close_action = QAction("Закрыть архив", self)
         self.close_action.triggered.connect(lambda: self.show_catalog(None))
         menu.addAction(self.close_action)
@@ -743,7 +756,14 @@ class ArchiveWindow(QMainWindow):
             detail = str(exc)
         QMessageBox.warning(self, "Операция не выполнена", detail)
 
-    def create_archive(self, demo: bool) -> None:
+    def create_archive(self, demo: bool, *, funds_demo: bool = False) -> None:
+        scope = "family"
+        if not demo:
+            choices = {label: key for key, label in SCOPES.items() if key != "legacy"}
+            choice, ok = QInputDialog.getItem(self, "Новый архив", "Область учёта", list(choices), editable=False)
+            if not ok:
+                return
+            scope = choices[choice]
         path = self.save_path("Создать тестовый архив" if demo else "Новый архив")
         if path is None:
             return
@@ -779,7 +799,20 @@ class ArchiveWindow(QMainWindow):
                 Opening(4, "2026-10-31", 250_000, "RUB", "DEMO-OZON"),
                 Opening(5, "2026-10-31", 500_000, "RUB", "DEMO-IP"),
             )) if demo else Ledger()
-            catalog = Catalog.create(path, password, cards=cards, assets=assets, ledger=ledger)
+            review = Review(recurring=(
+                Recurring("Аренда квартиры", 2, "аренда квартиры", "Жильё → Аренда", 700_000, 5, 1),
+            )) if demo else Review()
+            funds = Funds()
+            if funds_demo:
+                cards = ()
+                assets = (Asset("Семейный счёт", "account", "Семья"),)
+                ledger = Ledger(openings=(Opening(1, "2026-10-31", 2_000_000, "RUB", "DEMO-FUNDS"),))
+                review = Review()
+                funds = Funds(funds=(Fund("Семейный резерв", "Подушка", "RUB", 10_000_000, 1),))
+                funds = funds.set_template(Template("RUB", (Line(1, "fixed", 6_500_000),)))
+                funds = funds.apply("demo-opening", ((1, 500_000),))
+            catalog = Catalog.create(path, password, cards=cards, assets=assets, ledger=ledger,
+                                     review=review, funds=funds, scope=scope)
         except (OSError, ValueError) as exc:
             self.error(exc)
             return
@@ -802,7 +835,9 @@ class ArchiveWindow(QMainWindow):
     def show_catalog(self, catalog: Catalog | None) -> None:
         self.catalog = catalog
         self.active_tag = ""
-        self.archive_name.setText(catalog.path.name if catalog is not None else "Архив не открыт")
+        self.archive_name.setText(
+            f"{SCOPES[catalog.scope]} · {catalog.path.name}" if catalog is not None else "Архив не открыт"
+        )
         self.archive_hint.setText(
             "Только просмотр. Для правок восстановите личную копию."
             if catalog is not None and not catalog.editable else ""
@@ -813,6 +848,9 @@ class ArchiveWindow(QMainWindow):
         self.folders_button.setEnabled(catalog is not None)
         self.assets_button.setEnabled(catalog is not None)
         self.operations_button.setEnabled(catalog is not None)
+        self.overview_button.setEnabled(catalog is not None)
+        self.review_button.setEnabled(catalog is not None)
+        self.funds_button.setEnabled(catalog is not None)
         self.add_button.setEnabled(catalog is not None and catalog.editable)
         self.search.blockSignals(True)
         self.search.clear()
@@ -839,6 +877,22 @@ class ArchiveWindow(QMainWindow):
     def open_operations(self) -> None:
         if self.catalog is not None:
             dialog = LedgerDialog(self, self.catalog)
+            dialog.exec()
+            self.catalog = dialog.catalog
+
+    def open_overview(self) -> None:
+        if self.catalog is not None:
+            OverviewDialog(self, self.catalog).exec()
+
+    def open_review(self) -> None:
+        if self.catalog is not None:
+            dialog = ReviewDialog(self, self.catalog)
+            dialog.exec()
+            self.catalog = dialog.catalog
+
+    def open_funds(self) -> None:
+        if self.catalog is not None:
+            dialog = FundsDialog(self, self.catalog)
             dialog.exec()
             self.catalog = dialog.catalog
 
@@ -1028,7 +1082,7 @@ class ArchiveWindow(QMainWindow):
         if password is None:
             return
         try:
-            copy_verified(source, destination, password)
+            copy_verified(source, destination, password, restore_shared=restore)
             if restore:
                 self.show_catalog(Catalog.open(destination, password))
         except (OSError, ValueError, InvalidTag) as exc:
