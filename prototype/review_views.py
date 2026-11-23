@@ -15,6 +15,7 @@ from ledger import _normalized
 from ledger_views import table
 from operation_controls import CategoryField
 from review import Assignment, Recurring, Rule, RULE_FIELDS, TAX_PAYMENT, TRANSFER_WORDS, is_business, period
+from transfers import matching_account, signed_amount, transfer_route
 
 
 def fill_table(widget, rows):
@@ -117,6 +118,7 @@ class TransferDialog(QDialog):
         pair = next((item for item in self.review.transfers if number in (item.debit, item.credit)), None)
         if pair is not None:
             other = pair.credit if number == pair.debit else pair.debit
+            layout.addWidget(label(self.route(self.ledger.entries[other - 1].account), "sectionTitle", wrap=True))
             layout.addSpacing(10)
             layout.addWidget(label(self.entry_caption(other), "sectionTitle", wrap=True))
             layout.addWidget(label(self.ledger.entries[other - 1].description, "muted", wrap=True))
@@ -135,7 +137,10 @@ class TransferDialog(QDialog):
             self.account.addItem(f"{item.title} · {item.owner} · {item.currency}", item.asset_number)
         selected = self.review.transfer_targets().get(number)
         if selected is None:
-            if len(compatible) == 1:
+            known = matching_account(self.entry.counterparty, self.currency, self.ledger.openings)
+            if known != self.entry.account and known is not None:
+                selected = known
+            elif len(compatible) == 1:
                 selected = compatible[0].asset_number
             elif compatible:
                 suggested = self.review.transfer_candidates(self.ledger, number, excluded=self.excluded)
@@ -144,8 +149,10 @@ class TransferDialog(QDialog):
                     selected = next(iter(accounts))
         self.account.setCurrentIndex(max(0, self.account.findData(selected)))
         form = QFormLayout()
-        form.addRow(self.account.accessibleName(), self.account)
+        form.addRow("Куда перевод" if self.entry.amount < 0 else "Откуда перевод", self.account)
         layout.addLayout(form)
+        self.direction = label(style="sectionTitle", wrap=True)
+        layout.addWidget(self.direction)
         self.more = QCheckBox("Показать остальные операции в пределах 7 дней")
         layout.addWidget(self.more)
         self.grid = table(("№", "Дата", "Сумма", "Описание", "Комиссия", "Совпадение"), 3)
@@ -172,17 +179,22 @@ class TransferDialog(QDialog):
 
     def entry_caption(self, number):
         entry = self.ledger.entries[number - 1]
-        direction = "Со счёта" if entry.amount < 0 else "На счёт"
+        direction = "Списание со счёта" if entry.amount < 0 else "Зачисление на счёт"
         return (f"{direction} «{self.assets[entry.account].title}» · "
-                f"{amount_text(abs(entry.amount))} {self.currency} · {entry.day}")
+                f"{signed_amount(entry.amount)} {self.currency} · {entry.day}")
+
+    def route(self, other):
+        return transfer_route(self.entry.amount, self.assets[self.entry.account].title, self.assets[other].title)
 
     def refresh(self):
         account = self.account.currentData()
+        self.direction.setText(self.route(account) if account is not None else "")
+        self.direction.setVisible(account is not None)
         self.candidates = self.review.transfer_candidates(
             self.ledger, self.number, account=account, include_other=self.more.isChecked(), excluded=self.excluded,
         ) if account is not None else ()
         fill_table(self.grid, [
-            (number, entry.day, amount_text(entry.amount), entry.description, amount_text(fee), reason)
+            (number, entry.day, signed_amount(entry.amount), entry.description, amount_text(fee), reason)
             for number, fee, reason in self.candidates for entry in (self.ledger.entries[number - 1],)
         ])
         self.grid.clearSelection()
@@ -229,6 +241,58 @@ class TransferDialog(QDialog):
     def unlink(self):
         self.result_review = self.review.unlink(self.number)
         self.accept()
+
+
+def confirm_transfer_matches(parent, catalog, matches):
+    dialog = QDialog(parent)
+    dialog.setWindowTitle("Сверить переводы")
+    dialog.resize(970, 510)
+    layout = QVBoxLayout(dialog)
+    layout.setContentsMargins(20, 18, 20, 18)
+    layout.addWidget(label(dialog.windowTitle(), "screenTitle"))
+    layout.addWidget(label("Отметьте пары, которые действительно относятся к вашим переводам.", "muted", wrap=True))
+    grid = table(("Связать", "Откуда → куда", "Списание", "Зачисление", "Сумма", "Основание"), 1)
+    assets = {asset.asset_number: asset for asset in catalog.assets}
+    rows = []
+    for item in matches:
+        debit, credit = catalog.ledger.entries[item.debit - 1], catalog.ledger.entries[item.credit - 1]
+        source, target = assets[debit.account], assets[credit.account]
+        rows.append(("", transfer_route(debit.amount, source.title, target.title), debit.day, credit.day,
+                     f"{amount_text(credit.amount)} {target.currency}", item.reason))
+    fill_table(grid, rows)
+    for index, item in enumerate(matches):
+        grid.item(index, 0).setCheckState(Qt.CheckState.Checked if item.automatic else Qt.CheckState.Unchecked)
+        debit, credit = catalog.ledger.entries[item.debit - 1], catalog.ledger.entries[item.credit - 1]
+        grid.item(index, 1).setToolTip(f"− {debit.description}\n+ {credit.description}")
+    layout.addWidget(grid, 1)
+    actions = QHBoxLayout()
+
+    def select_all():
+        grid.blockSignals(True)
+        for index in range(len(matches)):
+            grid.item(index, 0).setCheckState(Qt.CheckState.Checked)
+        grid.blockSignals(False)
+        update_action()
+
+    actions.addWidget(button("Отметить все пары", select_all))
+    actions.addStretch(1)
+    actions.addWidget(button("Позже", dialog.reject))
+    apply = button("Связать выбранные", dialog.accept, primary=True)
+    actions.addWidget(apply)
+    layout.addLayout(actions)
+
+    def update_action():
+        apply.setEnabled(any(grid.item(index, 0).checkState() == Qt.CheckState.Checked
+                             for index in range(len(matches))))
+
+    grid.itemChanged.connect(update_action)
+    update_action()
+    review = catalog.review
+    if dialog.exec() == QDialog.DialogCode.Accepted:
+        for index, item in enumerate(matches):
+            if grid.item(index, 0).checkState() == Qt.CheckState.Checked:
+                review = review.link_transfer(catalog.ledger, item.debit, item.credit)
+    return review
 
 
 class RecurringDialog(QDialog):

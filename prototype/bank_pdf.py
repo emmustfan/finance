@@ -21,7 +21,7 @@ T_ROW = re.compile(rf"(?m)^[ \t]*(?P<event>{DAY})(?:[ \t]+{TIME})?[ \t]+(?P<day>
 O_ROW = re.compile(rf"(?m)^[ \t]*(?P<day>{DAY})[ \t]+{TIME}[ \t]+(?P<id>[0-9]{{6,18}})(?![0-9])")
 M_ROW = re.compile(rf"(?m)^[ \t]*(?P<number>[0-9]+)[ \t]+(?P<day>{DAY})[ \t]*(?P<text>[^\n]*?)\s*$")
 M_REF = re.compile(
-    r"(?im)^БИК[ \t]+[0-9]{9}[^\n]*сч[её]т(?:-копилка)?[ \t]*№[ \t]*"
+    r"(?im)^БИК[ \t]+[0-9]{9}[ \t]+(?P<label>[^\n]*?сч[её]т(?:-копилка)?)[ \t]*№[ \t]*"
     r"(?P<ref>[0-9]{20})[ \t]*\((?:RUR|RUB)\)"
 )
 M_TOTALS = re.compile(rf"(?im)^Итого оборотов:[ \t]*({CASH})[ \t]+({CASH})[ \t]*$")
@@ -68,6 +68,7 @@ class Section:
     declared_income: int | None = None
     declared_expenses: int | None = None
     entries: list[tuple[int, tuple[str, ...]]] = field(default_factory=list)
+    account_label: str = ""
 
     def add(self, day: str, amount: int, text: str, *, identifier="", counterparty="") -> None:
         if not amount:
@@ -104,7 +105,7 @@ class Section:
         opening_day = (date.fromisoformat(self.start) - timedelta(days=1)).isoformat()
         digest = hashlib.sha256(f"{file_digest}:{self.account}".encode()).hexdigest()
         return Statement(name, digest, COLUMNS, tuple(self.entries), "pdf", self.bank,
-                         (opening_day, opening, "RUB", self.account), (self.end, self.closing))
+                         (opening_day, opening, "RUB", self.account), (self.end, self.closing), self.account_label)
 
 
 def _segments(text: str, pattern):
@@ -191,7 +192,8 @@ def _modulbank(text_pages) -> list[Section]:
             if account in references:
                 raise ValueError("Модульбанк: в PDF несколько разделов одного счёта.")
             references.add(account)
-            active = Section("Модульбанк", account, _date(dates["start"]), _date(dates["end"]), opening)
+            active = Section("Модульбанк", account, _date(dates["start"]), _date(dates["end"]), opening,
+                             account_label=_clean(reference["label"]))
             sections.append(active)
         elif PERIOD.search(text):
             raise ValueError("Модульбанк: не удалось определить рублёвый счёт на странице.")

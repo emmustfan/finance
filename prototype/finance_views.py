@@ -26,7 +26,8 @@ from funds import Fund, goal_gap
 from ledger_views import LedgerDialog, import_statements, table
 from operation_controls import TAG_NAMES, TagCells, category_menu, choose_tags, selecting_rows
 from review import period
-from review_views import CategoryDialog, ReviewDialog, TransferDialog, fill_table
+from review_views import CategoryDialog, ReviewDialog, TransferDialog, confirm_transfer_matches, fill_table
+from transfers import signed_amount, suggested_transfers, transfer_route
 
 
 def display(value, currency):
@@ -541,14 +542,16 @@ class FinanceDialog(QDialog):
         self.pending_filter = button("Ждут пару", self.toggle_pending)
         self.pending_filter.setCheckable(True)
         top.addWidget(self.pending_filter)
+        self.find_transfers_button = button("Найти переводы…", self.find_transfers)
+        top.addWidget(self.find_transfers_button)
         top.addWidget(button("Выписки и сверка…", self.open_ledger))
         layout.addLayout(top)
         self.filter_notice = button("", self.clear_article_filter)
         layout.addWidget(self.filter_notice, alignment=Qt.AlignmentFlag.AlignLeft)
-        self.operations = table(("Дата", "Кошелёк", "Вид  ▾", "Сумма", "Статья  ▾", "Описание", "Теги  ▾"), 5)
+        self.operations = table(("Дата", "Кошелёк", "Вид  ▾", "Сумма", "Статья / направление", "Описание", "Теги  ▾"), 5)
         self.operations.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         self.operations.setItemDelegateForColumn(self.TAGS, TagCells(self.operations))
-        for column, width in ((1, 120), (self.ARTICLE, 163), (self.TAGS, 130)):
+        for column, width in ((1, 120), (self.ARTICLE, 206), (self.TAGS, 112)):
             self.operations.horizontalHeader().setSectionResizeMode(column, QHeaderView.ResizeMode.Interactive)
             self.operations.setColumnWidth(column, width)
         self.operations.cellClicked.connect(self.operation_clicked)
@@ -780,19 +783,20 @@ class FinanceDialog(QDialog):
         waiting_only = self.pending_filter.isChecked()
         self.pending_filter.setText(f"Ждут пару · {pending}")
         self.pending_filter.setVisible(bool(pending))
+        self.find_transfers_button.setEnabled(self.catalog.editable and bool(self.catalog.ledger.entries))
         articles = {}
         for row in self.rows:
             if row.kind == "transfer":
                 target = titles[row.transfer_account]
-                route = f"На «{target}»" if row.amount < 0 else f"С «{target}»"
+                route = transfer_route(row.amount, titles[row.account], target)
                 articles[row.number] = f"Ждёт пару · {route}" if row.pair is None else route
         self.filtered = tuple(row for row in self.rows if self.matches_article(row) and all(
-            word in f"{titles[row.account]} {articles.get(row.number, row.category)} "
+            word in f"{titles[row.account]} {row.category} {articles.get(row.number, '')} "
                     f"{row.description} {row.recipient} {' '.join(row.tags)}".casefold()
             for word in query) and (not waiting_only or (row.kind == "transfer" and row.pair is None)))
         self.operations.blockSignals(True)
         fill_table(self.operations, [
-            (row.day, titles[row.account], FLOW_LABELS[row.kind], display(row.amount, row.currency),
+            (row.day, titles[row.account], FLOW_LABELS[row.kind], f"{signed_amount(row.amount)} {row.currency}",
              articles.get(row.number, row.category), row.description + (f" · комиссия {amount_text(row.fee)}" if row.fee else ""),
              ", ".join(row.tags))
             for row in self.filtered
@@ -1076,6 +1080,17 @@ class FinanceDialog(QDialog):
         dialog = TransferDialog(self, self.catalog, number)
         if dialog.exec() == QDialog.DialogCode.Accepted:
             self.save_classification(dialog.result_review, self.catalog.directory)
+
+    def find_transfers(self):
+        matches = suggested_transfers(
+            self.catalog.ledger, self.catalog.review, self.catalog.assets,
+            excluded=(move.operation for move in self.catalog.funds.movements),
+        )
+        if matches:
+            review = confirm_transfer_matches(self, self.catalog, matches)
+            self.save_classification(review, self.catalog.directory)
+        else:
+            QMessageBox.information(self, "Переводы", "Подходящих пар в журнале пока нет.")
 
     def save_classification(self, review, directory):
         if (review, directory) == (self.catalog.review, self.catalog.directory):

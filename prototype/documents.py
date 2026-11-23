@@ -201,7 +201,9 @@ def _encode_catalog(
             content["ledger"] = ledger.to_payload()
         if review != Review():
             content["review"] = review.to_payload()
-        if review.pending_transfers:
+        if review.ignored_transfers:
+            content["format_revision"] = 4
+        elif review.pending_transfers:
             content["format_revision"] = 3
         elif review.tags or review.debts.items:
             content["format_revision"] = 2
@@ -228,7 +230,7 @@ def decode_catalog(
         optional_sections = {"ledger", "review", "funds", "directory", "scope", "format_revision"}
         if isinstance(content, dict) and set(content) - optional_sections == {"cards", "assets"}:
             items = content["cards"]
-            if "format_revision" in content and content["format_revision"] not in (2, 3):
+            if "format_revision" in content and content["format_revision"] not in (2, 3, 4):
                 raise ValueError("Для этого формата требуется более новая версия приложения.")
             if "ledger" in content:
                 ledger = Ledger.from_payload(content["ledger"])

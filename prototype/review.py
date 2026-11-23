@@ -93,6 +93,7 @@ class Review:
     tags: tuple[OperationTags, ...] = ()
     debts: Debts = Debts()
     pending_transfers: tuple[PendingTransfer, ...] = ()
+    ignored_transfers: tuple[int, ...] = ()
 
     def to_payload(self) -> dict:
         payload = asdict(self)
@@ -102,6 +103,8 @@ class Review:
             del payload["debts"]
         if not self.pending_transfers:
             del payload["pending_transfers"]
+        if not self.ignored_transfers:
+            del payload["ignored_transfers"]
         return payload
 
     @classmethod
@@ -115,6 +118,7 @@ class Review:
             tags=tuple(OperationTags(item["operation"], tuple(item["names"])) for item in payload.get("tags", ())),
             debts=Debts.from_payload(payload["debts"]) if "debts" in payload else Debts(),
             pending_transfers=tuple(PendingTransfer(**item) for item in payload.get("pending_transfers", ())),
+            ignored_transfers=tuple(payload.get("ignored_transfers", ())),
         )
 
     @property
@@ -205,6 +209,11 @@ class Review:
                 or asset.currency != opening_by_account[entry.account].currency
             ):
                 raise ValueError("Выберите другой счёт в той же валюте.")
+        ignored = set(self.ignored_transfers)
+        if len(ignored) != len(self.ignored_transfers) or ignored & self.reserved_operations:
+            raise ValueError("У операции уже установлен другой вид.")
+        for number in ignored:
+            operation(ledger, number)
         tagged = set()
         for item in self.tags:
             operation(ledger, item.operation)
@@ -310,6 +319,7 @@ class Review:
             pending = (*(item for item in pending if item.operation != number), PendingTransfer(number, account))
         waiting = self.waiting if number in self.waiting else (*self.waiting, number)
         return replace(self, waiting=waiting, pending_transfers=pending,
+                       ignored_transfers=tuple(item for item in self.ignored_transfers if item != number),
                        assignments=tuple(item for item in self.assignments if item.operation != number))
 
     def link_transfer(self, ledger: Ledger, first: int, second: int) -> "Review":
@@ -329,14 +339,22 @@ class Review:
             self, transfers=(*self.transfers, pair), waiting=tuple(num for num in self.waiting if num not in touched),
             assignments=tuple(item for item in self.assignments if item.operation not in touched),
             pending_transfers=tuple(item for item in self.pending_transfers if item.operation not in touched),
+            ignored_transfers=tuple(item for item in self.ignored_transfers if item not in touched),
         )
 
     def unlink(self, number: int) -> "Review":
+        pair = next((pair for pair in self.transfers if number in (pair.debit, pair.credit)), None)
+        ordinary = (pair.debit, pair.credit) if pair else (number,) if number in self.waiting else ()
         return replace(
             self, transfers=tuple(pair for pair in self.transfers if number not in (pair.debit, pair.credit)),
             waiting=tuple(item for item in self.waiting if item != number),
             pending_transfers=tuple(item for item in self.pending_transfers if item.operation != number),
-        )
+        ).keep_ordinary(ordinary)
+
+    def keep_ordinary(self, numbers) -> "Review":
+        if not numbers:
+            return self
+        return replace(self, ignored_transfers=tuple(sorted({*self.ignored_transfers, *numbers})))
 
     def assign(self, items: tuple[Assignment, ...]) -> "Review":
         fixed = self.fixed_operations
@@ -364,7 +382,8 @@ class Review:
         return replace(self, debts=debts,
                        assignments=tuple(item for item in self.assignments if item.operation != attached),
                        waiting=tuple(item for item in self.waiting if item != attached),
-                       pending_transfers=tuple(item for item in self.pending_transfers if item.operation != attached))
+                       pending_transfers=tuple(item for item in self.pending_transfers if item.operation != attached),
+                       ignored_transfers=tuple(item for item in self.ignored_transfers if item != attached))
 
     def learn(self, rule: Rule) -> "Review":
         rules = tuple(item for item in self.rules if (item.field, _normalized(item.pattern), item.direction)

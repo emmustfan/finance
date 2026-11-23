@@ -9,7 +9,7 @@ from PySide6.QtCore import Qt
 from PySide6.QtGui import QColor, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QAbstractItemView, QDialog, QFileDialog, QFormLayout, QHBoxLayout, QHeaderView,
-    QLineEdit, QMessageBox, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
+    QLineEdit, QMenu, QMessageBox, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
 )
 
 from appearance import ChoiceBox, button, label
@@ -23,6 +23,7 @@ from ledger import (
     preview_import, read_statement, reference_matches,
 )
 from operation_controls import TAG_NAMES, TagCells, category_menu, choose_tags, selecting_rows
+from transfers import matching_account, own_transfer_hint, signed_amount, suggested_transfers, transfer_route
 
 FIELDS = {
     "date": "Дата", "amount": "Сумма со знаком", "description": "Описание",
@@ -32,6 +33,11 @@ FIELDS = {
 }
 STATES = {"new": "Новая", "duplicate": "Повтор", "review": "На сверку", "error": "Ошибка"}
 NEW_ACCOUNT = "new"
+
+
+def statement_account_title(statement: Statement) -> str:
+    title = statement.account_label or statement.bank
+    return f"{title} · •{statement.opening_hint[3][-4:]}"
 
 
 def table(headers: tuple[str, ...], stretch: int) -> QTableWidget:
@@ -90,19 +96,25 @@ class DetailsDialog(QDialog):
 
 
 class ImportDialog(QDialog):
-    STATUS, DATE, DESCRIPTION, AMOUNT, ARTICLE, TAGS = range(6)
+    STATUS, DATE, DESCRIPTION, AMOUNT, KIND, ARTICLE, TAGS = range(7)
 
-    def __init__(self, parent, statement: Statement, catalog: Catalog, *, position=None):
+    def __init__(self, parent, statement: Statement, catalog: Catalog, *, position=None, batch=()):
         super().__init__(parent)
         self.statement = statement
         self.catalog = catalog
         self.initial_catalog = catalog
         self.result_catalog = catalog
         self.is_pdf = statement.opening_hint is not None
+        self.batch = batch
         self.preview = None
         self.articles = {}
         self.tags = {}
         self.suggestions = {}
+        self.transfer_choices = {}
+        self.transfer_defaults = {}
+        self.maybe_transfers = {}
+        self.transfer_decisions = {}
+        self.transfer_intents = {}
         self.pending_openings = {}
         self.setWindowTitle("Импорт выписки")
         self.resize(1110, 700)
@@ -111,7 +123,9 @@ class ImportDialog(QDialog):
         layout.addWidget(label(statement.name, "screenTitle", wrap=True))
         if self.is_pdf:
             _, _, currency, reference = statement.opening_hint
-            layout.addWidget(label(f"{statement.bank} · Счёт •{reference[-4:]} · {currency}", "muted"))
+            layout.addWidget(label(f"{statement.bank} · {statement_account_title(statement)} · {currency}"
+                                   if statement.account_label else
+                                   f"{statement.bank} · Счёт •{reference[-4:]} · {currency}", "muted"))
         if position is not None:
             number, total = position
             layout.addWidget(label(f"Шаг {number} из {total} · Все выписки сохранятся вместе", "muted"))
@@ -157,28 +171,32 @@ class ImportDialog(QDialog):
         controls = QHBoxLayout()
         self.filter = ChoiceBox()
         for key, title in (("all", "Все строки"), ("unclassified", "Без статьи"), ("expense", "Списания"),
-                           ("income", "Поступления"), ("review", "На сверку и с ошибками")):
+                           ("income", "Поступления"), ("transfer", "Переводы и подсказки"),
+                           ("review", "На сверку и с ошибками")):
             self.filter.addItem(title, key)
         controls.addWidget(self.filter)
         controls.addStretch(1)
         self.suggest_button = button("Принять подсказки", self.accept_suggestions)
         controls.addWidget(self.suggest_button)
-        self.article_button = button("Статья для выбранных…", self.selected_article)
+        self.article_button = button("Статья…", self.selected_article)
         controls.addWidget(self.article_button)
-        self.tags_button = button("Теги для выбранных…", self.selected_tags)
+        self.transfer_button = button("Перевод…", self.selected_transfer)
+        controls.addWidget(self.transfer_button)
+        self.tags_button = button("Теги…", self.selected_tags)
         controls.addWidget(self.tags_button)
         self.whole_tag_button = button("Тег на всю выписку…", self.whole_tags)
         controls.addWidget(self.whole_tag_button)
         layout.addLayout(controls)
 
-        self.grid = table(("Статус", "Дата", "Описание", "Сумма", "Статья  ▾", "Теги  ▾"), self.DESCRIPTION)
+        self.grid = table(("Статус", "Дата", "Описание", "Сумма", "Вид  ▾", "Статья / направление", "Теги  ▾"),
+                          self.DESCRIPTION)
         self.grid.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         self.grid.setItemDelegateForColumn(self.TAGS, TagCells(self.grid))
-        for column, width in ((self.ARTICLE, 190), (self.TAGS, 140)):
+        for column, width in ((self.KIND, 115), (self.ARTICLE, 245), (self.TAGS, 114)):
             self.grid.horizontalHeader().setSectionResizeMode(column, QHeaderView.ResizeMode.Interactive)
             self.grid.setColumnWidth(column, width)
         self.grid.setAccessibleName("Операции выписки")
-        self.grid.setToolTip("Нажмите на статью или теги в строке. Shift и Cmd/Ctrl выделяют несколько операций.")
+        self.grid.setToolTip("Нажмите «Вид», чтобы отметить перевод, или выберите статью и теги.")
         self.grid.itemChanged.connect(self.status_changed)
         self.grid.cellClicked.connect(self.cell_clicked)
         self.grid.itemSelectionChanged.connect(self.refresh_buttons)
@@ -251,10 +269,12 @@ class ImportDialog(QDialog):
             if self.is_pdf:
                 _, _, currency, reference = self.statement.opening_hint
                 bank = self.statement.bank
-                title = bank + f" · •{reference[-4:]}"
+                title = statement_account_title(self.statement)
             dialog = WalletEditor(self, self.catalog, stage=True, title=title, bank=bank, currency=currency,
                                   opening_from_pdf=self.is_pdf, opening_required=not self.is_pdf,
                                   snapshot_day=None if self.is_pdf else self.csv_snapshot_day())
+            if "копилка" in self.statement.account_label.casefold():
+                dialog.kind.setCurrentText("Накопительный счёт")
             if dialog.exec() != QDialog.DialogCode.Accepted:
                 self.fill_accounts(self.selected_account)
                 return
@@ -298,6 +318,9 @@ class ImportDialog(QDialog):
         self.articles.clear()
         self.tags.clear()
         self.suggestions.clear()
+        self.transfer_defaults.clear()
+        self.maybe_transfers.clear()
+        self.transfer_decisions.clear()
         self.grid.setRowCount(0)
         self.setup.clear()
         self.balance.clear()
@@ -316,12 +339,13 @@ class ImportDialog(QDialog):
                 self.opening_button.show()
                 self.summary.setText("Для CSV нужен начальный остаток выбранного счёта.")
                 return
-            staged = prepare_statement_account(staged, self.accounts[account], self.statement)
+            staged = prepare_statement_account(staged, self.accounts[account], self.statement, self.mapping())
             preview = preview_import(staged, account, self.statement, self.mapping())
         except ValueError as exc:
             self.summary.setText(str(exc))
             return
         self.preview, self.preview_ledger = preview, staged
+        self.transfer_choices = self.other_accounts(account)
         if self.catalog.ledger.opening(account) is None:
             opening = staged.opening(account)
             self.setup.setText(f"Начальный остаток на {opening.day} · {amount_text(opening.amount)} {opening.currency}")
@@ -336,11 +360,23 @@ class ImportDialog(QDialog):
             self.grid.setItem(index, self.STATUS, status)
             entry = row.entry
             if entry and row.state in ("new", "review"):
+                matches = [
+                    key for key, (_, reference) in self.transfer_choices.items()
+                    if reference_matches(entry.counterparty, reference)
+                ]
+                if len(matches) == 1:
+                    key = matches[0]
+                    if "*" not in entry.counterparty and "*" not in self.transfer_choices[key][1]:
+                        self.transfer_defaults[row.line] = key
+                    else:
+                        self.maybe_transfers[row.line] = key
+                elif own_transfer_hint(entry.description):
+                    self.maybe_transfers[row.line] = None
                 suggestion = self.catalog.directory.suggestion(self.catalog.review, entry)
                 if suggestion:
                     self.suggestions[row.line] = suggestion
             values = (entry.day if entry else "", " · ".join(filter(None, (entry.description if entry else "", row.message))),
-                      amount_text(entry.amount) if entry else "", "", "")
+                      signed_amount(entry.amount) if entry else "", "", "", "")
             for column, value in enumerate(values, start=1):
                 item = QTableWidgetItem(value)
                 item.setToolTip(value)
@@ -351,6 +387,34 @@ class ImportDialog(QDialog):
         self.grid.blockSignals(False)
         self.show_balance()
         self.refresh_filter()
+
+    def other_accounts(self, account):
+        origin = self.preview_ledger.opening(account)
+        openings = self.preview_ledger.openings
+        reference_by_number = {item.account: item.reference for item in openings}
+        choices = {
+            asset.asset_number: (asset.title, reference_by_number.get(asset.asset_number, ""))
+            for asset in self.catalog.assets
+            if asset.category == "account" and asset.currency == origin.currency and asset.asset_number != account
+        }
+        for statement in self.batch:
+            if statement.opening_hint is None:
+                continue
+            _, _, currency, reference = statement.opening_hint
+            if (
+                currency != origin.currency or reference_matches(reference, origin.reference)
+                or any(item.currency == currency and reference_matches(reference, item.reference) for item in openings)
+                or any(reference_matches(reference, key) for key in choices if isinstance(key, str))
+            ):
+                continue
+            choices[reference] = statement_account_title(statement), reference
+        return choices
+
+    def transfer_for(self, line):
+        return self.transfer_decisions.get(line, self.transfer_defaults.get(line))
+
+    def looks_like_transfer(self, line):
+        return line not in self.transfer_decisions and line in self.maybe_transfers
 
     def included(self, index):
         row = self.preview.rows[index]
@@ -373,11 +437,30 @@ class ImportDialog(QDialog):
         suggestion = self.suggestions.get(row.line) if row.line not in self.articles else None
         category = self.articles.get(row.line)
         caption = category or (f"≈ {suggestion.category}" if suggestion else "Выбрать")
-        article, tags = self.grid.item(index, self.ARTICLE), self.grid.item(index, self.TAGS)
+        kind, article, tags = (self.grid.item(index, column) for column in (self.KIND, self.ARTICLE, self.TAGS))
+        target = self.transfer_for(row.line)
+        hint = self.looks_like_transfer(row.line)
+        if can_edit:
+            movement = "Доход" if row.entry.amount > 0 else "Расход"
+            if target is not None:
+                movement = "Перевод"
+            elif hint:
+                movement = "Проверить"
+            kind.setText(f"{movement}  ▾")
+            kind.setToolTip("Перевод по реквизитам счета" if row.line in self.transfer_defaults
+                            and row.line not in self.transfer_decisions else "Выбрать вид операции")
+            if target is not None:
+                caption = self.route(row, target)
+            elif hint:
+                caption = "Возможный перевод"
+            kind.setForeground(QColor("#146951"))
+        else:
+            kind.setText("—")
         tag_text = ", ".join(self.tags.get(row.line, ()))
-        article.setText(f"{caption}  ▾" if can_edit else "—")
-        article.setToolTip(suggestion.reason if suggestion else (category or "Выбрать статью") if can_edit else "")
-        article.setForeground(QColor("#146951" if can_edit and not suggestion else "#53657D"))
+        article.setText((caption if target is not None else f"{caption}  ▾") if can_edit else "—")
+        article.setToolTip((caption if target is not None or hint else suggestion.reason if suggestion
+                            else category or "Выбрать статью") if can_edit else "")
+        article.setForeground(QColor("#146951" if can_edit and (target is not None or not suggestion) else "#53657D"))
         tags.setText(f"{tag_text or '+ Тег'}  ▾" if can_edit else "—")
         tags.setData(TAG_NAMES, self.tags.get(row.line, ()) if can_edit else ())
         tags.setToolTip(tag_text or ("Изменить теги" if can_edit else ""))
@@ -388,8 +471,11 @@ class ImportDialog(QDialog):
             return
         choice = self.filter.currentData()
         for index, row in enumerate(self.preview.rows):
+            is_transfer = self.transfer_for(row.line) is not None
             visible = (
-                choice == "all" or (choice == "unclassified" and self.included(index) and not self.articles.get(row.line))
+                choice == "all" or (choice == "unclassified" and self.included(index) and not is_transfer
+                                    and not self.articles.get(row.line))
+                or (choice == "transfer" and (is_transfer or self.looks_like_transfer(row.line)))
                 or (choice == "review" and row.state in ("review", "error"))
                 or (row.entry is not None and (choice == "expense" and row.entry.amount < 0
                                                or choice == "income" and row.entry.amount > 0))
@@ -407,8 +493,10 @@ class ImportDialog(QDialog):
         chosen = self.selected()
         directions = {self.preview.rows[index].entry.amount > 0 for index in chosen}
         included = tuple(row for index, row in enumerate(self.preview.rows) if self.included(index)) if self.preview else ()
-        hints = sum(row.line in self.suggestions and row.line not in self.articles for row in included)
-        self.article_button.setEnabled(len(directions) == 1)
+        hints = sum(self.can_accept_article(row.line) for row in included)
+        as_transfer = any(self.transfer_for(self.preview.rows[index].line) is not None for index in chosen)
+        self.article_button.setEnabled(len(directions) == 1 and not as_transfer)
+        self.transfer_button.setEnabled(bool(chosen))
         self.tags_button.setEnabled(bool(chosen))
         self.whole_tag_button.setEnabled(bool(included))
         self.suggest_button.setEnabled(hints > 0)
@@ -416,8 +504,11 @@ class ImportDialog(QDialog):
         if self.preview is None:
             return
         counts = Counter(row.state for row in self.preview.rows)
-        remaining = sum(not self.articles.get(row.line) for row in included)
+        transfers = sum(self.transfer_for(row.line) is not None for row in included)
+        remaining = sum(self.transfer_for(row.line) is None and not self.articles.get(row.line) for row in included)
         summary = [f"К добавлению {len(included)}", f"без статьи {remaining}"]
+        if transfers:
+            summary.append(f"переводы {transfers}")
         summary.extend(f"{title} {counts[key]}" for key, title in (("duplicate", "повторы"), ("review", "на сверку"),
                                                                    ("error", "ошибки")) if counts[key])
         self.summary.setText(" · ".join(summary))
@@ -449,6 +540,8 @@ class ImportDialog(QDialog):
         self.catalog = replace(self.catalog, directory=directory)
         for index, row in zip(indices, rows):
             self.articles[row.line] = name
+            if row.line in self.maybe_transfers or row.line in self.transfer_defaults:
+                self.transfer_decisions[row.line] = None
             self.paint_row(index)
         self.refresh_filter()
 
@@ -460,10 +553,95 @@ class ImportDialog(QDialog):
 
     def accept_suggestions(self):
         for index, row in enumerate(self.preview.rows):
-            if self.included(index) and row.line in self.suggestions and row.line not in self.articles:
+            if self.included(index) and self.can_accept_article(row.line):
                 self.articles[row.line] = self.suggestions[row.line].category
                 self.paint_row(index)
         self.refresh_filter()
+
+    def can_accept_article(self, line):
+        return (line in self.suggestions and line not in self.articles and self.transfer_for(line) is None
+                and not self.looks_like_transfer(line))
+
+    def route(self, row, target):
+        title = self.accounts[row.entry.account].title
+        return transfer_route(row.entry.amount, title, self.transfer_choices[target][0])
+
+    def selected_transfer(self):
+        self.choose_transfer(self.selected())
+
+    def choose_transfer(self, indices):
+        if not indices:
+            return
+        first = self.preview.rows[indices[0]]
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Перевод между своими счетами")
+        dialog.setMinimumWidth(520)
+        layout = QVBoxLayout(dialog)
+        layout.setContentsMargins(20, 18, 20, 18)
+        layout.addWidget(label(dialog.windowTitle(), "screenTitle"))
+        if len(indices) == 1:
+            title = self.accounts[first.entry.account].title
+            currency = self.accounts[first.entry.account].currency
+            direction = "Списание со счёта" if first.entry.amount < 0 else "Зачисление на счёт"
+            caption = f"{direction} «{title}» · {signed_amount(first.entry.amount)} {currency} · {first.entry.day}"
+        else:
+            caption = f"Выбрано операций · {len(indices)}"
+        layout.addWidget(label(caption, "muted", wrap=True))
+        account = ChoiceBox()
+        account.addItem("Выберите второй счёт", None)
+        for key, (title, _) in self.transfer_choices.items():
+            account.addItem(title, key)
+        target = self.transfer_for(first.line)
+        if target is None:
+            target = self.maybe_transfers.get(first.line)
+        if target is None and len(self.transfer_choices) == 1:
+            target = next(iter(self.transfer_choices))
+        account.setCurrentIndex(max(0, account.findData(target)))
+        account.setAccessibleName("Второй счёт")
+        layout.addWidget(account)
+        direction = label(style="sectionTitle", wrap=True)
+        layout.addWidget(direction)
+        actions = QHBoxLayout()
+        actions.addStretch(1)
+        actions.addWidget(button("Отмена", dialog.reject))
+        apply = button("Выбрать счёт", dialog.accept, primary=True)
+        actions.addWidget(apply)
+        layout.addLayout(actions)
+
+        def refresh():
+            key = account.currentData()
+            apply.setEnabled(key is not None)
+            if key is not None:
+                directions = dict.fromkeys(self.route(self.preview.rows[index], key) for index in indices)
+                direction.setText("\n".join(directions))
+            elif self.transfer_choices:
+                direction.setText("Выберите второй счёт, чтобы увидеть направление.")
+            else:
+                direction.setText("Добавьте второй счёт или выберите обе выписки для импорта.")
+
+        account.currentIndexChanged.connect(refresh)
+        refresh()
+        if dialog.exec() == QDialog.DialogCode.Accepted and account.currentData() is not None:
+            for index in indices:
+                row = self.preview.rows[index]
+                self.transfer_decisions[row.line] = account.currentData()
+                self.articles.pop(row.line, None)
+                self.paint_row(index)
+            self.refresh_filter()
+
+    def change_kind(self, index):
+        row = self.preview.rows[index]
+        menu = QMenu(self)
+        ordinary = menu.addAction("Доход" if row.entry.amount > 0 else "Расход")
+        transfer = menu.addAction("Перевод между своими счетами…")
+        rect = self.grid.visualItemRect(self.grid.item(index, self.KIND))
+        choice = menu.exec(self.grid.viewport().mapToGlobal(rect.bottomLeft()))
+        if choice == transfer:
+            self.choose_transfer((index,))
+        elif choice == ordinary:
+            self.transfer_decisions[row.line] = None
+            self.paint_row(index)
+            self.refresh_filter()
 
     def edit_tags(self, indices):
         if not indices:
@@ -489,7 +667,13 @@ class ImportDialog(QDialog):
     def cell_clicked(self, index, column):
         if self.preview is None or not self.included(index) or selecting_rows():
             return
-        if column == self.ARTICLE:
+        if column == self.KIND:
+            self.change_kind(index)
+        elif column == self.ARTICLE:
+            row = self.preview.rows[index]
+            if self.transfer_for(row.line) is not None or self.looks_like_transfer(row.line):
+                self.change_kind(index)
+                return
             rect = self.grid.visualItemRect(self.grid.item(index, column))
             self.article_at((index,), self.grid.viewport().mapToGlobal(rect.bottomLeft()))
         elif column == self.TAGS:
@@ -502,11 +686,24 @@ class ImportDialog(QDialog):
             reply = QMessageBox.question(self, "В выписке есть ошибки", "Импортировать допустимые строки?")
             if reply != QMessageBox.StandardButton.Yes:
                 return
-        ledger, review = apply_statement(self.preview_ledger, self.catalog.review, self.preview, self.confirmed_lines(),
+        confirmed = self.confirmed_lines()
+        ledger, review = apply_statement(self.preview_ledger, self.catalog.review, self.preview, confirmed,
                                          self.articles, self.tags)
+        posted = self.preview.accepted_rows(confirmed)
+        if len(ledger.entries) > len(self.preview_ledger.entries):
+            numbers = {row.line: number for number, row in enumerate(posted, start=len(self.preview_ledger.entries) + 1)}
+            self.transfer_intents = {number: target for line, number in numbers.items()
+                                     if (target := self.transfer_for(line)) is not None}
+            ordinary = tuple(number for line, number in numbers.items()
+                             if line in self.transfer_decisions and self.transfer_decisions[line] is None)
+            review = review.keep_ordinary(ordinary)
         assets = self.initial_catalog.assets
         if self.preview.account not in {asset.asset_number for asset in assets} and ledger.opening(self.preview.account):
             assets = (*assets, self.accounts[self.preview.account])
+        if self.statement.bank:
+            assets = tuple(replace(asset, organization=self.statement.bank)
+                           if asset.asset_number == self.preview.account and not asset.organization else asset
+                           for asset in assets)
         self.result_catalog = replace(self.catalog, assets=assets, ledger=ledger, review=review)
         self.accept()
 
@@ -525,17 +722,46 @@ def import_statements(parent, catalog: Catalog) -> Catalog:
                 statements.append(read_statement(path))
         statements.sort(key=lambda item: item.opening_hint[0] if item.opening_hint else "9999")
         staged = catalog
+        intents = {}
         for index, statement in enumerate(statements, start=1):
             position = (index, len(statements)) if len(statements) > 1 else None
-            dialog = ImportDialog(parent, statement, staged, position=position)
+            dialog = ImportDialog(parent, statement, staged, position=position, batch=statements)
             if dialog.exec() != QDialog.DialogCode.Accepted:
                 return catalog
             staged = dialog.result_catalog
+            intents.update(dialog.transfer_intents)
+        if len(staged.ledger.entries) > len(catalog.ledger.entries):
+            staged = review_import_transfers(parent, staged, len(catalog.ledger.entries), intents)
         if staged != catalog:
             return catalog.save_import(staged)
     except (OSError, ValueError) as exc:
         QMessageBox.warning(parent, "Импорт выписок", str(exc))
     return catalog
+
+
+def review_import_transfers(parent, catalog, previous_count, intents):
+    from review_views import confirm_transfer_matches
+
+    ledger, review = catalog.ledger, catalog.review
+    for number, target in intents.items():
+        entry = ledger.entries[number - 1]
+        if isinstance(target, str):
+            target = matching_account(target, ledger.opening(entry.account).currency, ledger.openings)
+        if target is None:
+            raise ValueError("Не удалось сопоставить выбранный счёт перевода с выпиской.")
+        review = review.wait_for_transfer(ledger, number, target)
+    matches = suggested_transfers(
+        ledger, review, catalog.assets, excluded=(move.operation for move in catalog.funds.movements),
+        touched=range(previous_count + 1, len(ledger.entries) + 1),
+    )
+    for item in matches:
+        if item.automatic:
+            review = review.link_transfer(ledger, item.debit, item.credit)
+    staged = replace(catalog, review=review)
+    candidates = tuple(item for item in matches if not item.automatic)
+    if candidates:
+        staged = replace(staged, review=confirm_transfer_matches(parent, staged, candidates))
+    return staged
 
 
 class LedgerDialog(QDialog):
@@ -552,7 +778,7 @@ class LedgerDialog(QDialog):
         self.fill_accounts()
         layout.addWidget(self.account)
         actions = QHBoxLayout()
-        self.opening_button = button("Начальный остаток…", self.set_opening)
+        self.opening_button = button("Начальный остаток и реквизиты…", self.set_opening)
         self.manual_button = button("+ Операция", self.add_manual)
         self.import_button = button("Импорт PDF и CSV…", self.import_files, primary=True)
         self.check_button = button("Сверить остаток…", self.reconcile)

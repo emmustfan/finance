@@ -206,6 +206,7 @@ class Statement:
     bank: str = ""
     opening_hint: tuple[str, int, str, str] | None = None
     closing_hint: tuple[str, int] | None = None
+    account_label: str = ""
 
     def suggested_columns(self) -> dict[str, int]:
         normalized = [_normalized(column) for column in self.columns]
@@ -258,7 +259,14 @@ def read_statement(path: Path) -> Statement:
 
 
 def reference_matches(candidate: str, known: str) -> bool:
-    left, right = _normalized(candidate), _normalized(known)
+    def comparable(text):
+        normalized = _normalized(text)
+        compact = normalized.replace(" ", "")
+        if re.fullmatch(r"[0-9]{20}|[0-9]{6}\*+[0-9]{4}", compact):
+            return compact
+        return normalized
+
+    left, right = comparable(candidate), comparable(known)
     if not left or not right:
         return False
     if left == right:
@@ -270,13 +278,19 @@ def reference_matches(candidate: str, known: str) -> bool:
     return False
 
 
-def prepare_statement_account(ledger: Ledger, asset: Asset, statement: Statement) -> Ledger:
-    if statement.opening_hint is None:
+def prepare_statement_account(ledger: Ledger, asset: Asset, statement: Statement, mapping=None) -> Ledger:
+    opening = ledger.opening(asset.asset_number)
+    if statement.opening_hint is not None:
+        day, amount, currency, reference = statement.opening_hint
+    elif mapping is not None and opening is not None:
+        day, amount, currency = opening.day, opening.amount, opening.currency
+        reference = statement.reference(mapping)
+        if not reference:
+            return ledger
+    else:
         return ledger
-    day, amount, currency, reference = statement.opening_hint
     if asset.currency != currency:
         raise ValueError("Валюта выписки отличается от валюты выбранного счёта.")
-    opening = ledger.opening(asset.asset_number)
     if opening is not None and opening.reference and not reference_matches(reference, opening.reference):
         raise ValueError("Реквизит в выписке отличается от реквизита выбранного счёта.")
     if any(item.account != asset.asset_number and reference_matches(reference, item.reference)
@@ -284,7 +298,7 @@ def prepare_statement_account(ledger: Ledger, asset: Asset, statement: Statement
         raise ValueError("Этот реквизит уже привязан к другому счёту архива.")
     if opening is None:
         return ledger.set_opening(Opening(asset.asset_number, day, amount, currency, reference))
-    if not opening.reference:
+    if not opening.reference or ("*" in opening.reference and re.fullmatch(r"[0-9]{20}", reference)):
         return ledger.set_opening(replace(opening, reference=reference))
     return ledger
 
