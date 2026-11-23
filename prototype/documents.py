@@ -9,15 +9,17 @@ import re
 import stat
 import tempfile
 from dataclasses import asdict, dataclass, field, fields, replace
+from datetime import date, timedelta
 from io import BytesIO
 from pathlib import Path
 
 from PIL import Image, ImageOps
 
 from assets import Asset, validate_assets
+from finance import Directory
 from funds import Funds
-from ledger import Ledger
-from review import Review
+from ledger import Entry, Ledger, Opening, _day
+from review import Assignment, Review
 from vault import (
     DOCUMENT_MAGIC, MAGIC, MAX_DOCUMENT_DATA, MAX_PDF, UnlockedVault, _check_pdf,
     _write_new, configure_group, group_for_directory, read_container,
@@ -147,7 +149,7 @@ def read_pdf(path: Path) -> bytes:
 
 def _encode_catalog(
     cards: tuple[Card, ...], assets: tuple[Asset, ...], ledger: Ledger,
-    review: Review, funds: Funds, scope: str,
+    review: Review, funds: Funds, directory: Directory, scope: str,
 ) -> bytes:
     attachment_bytes = sum(
         len(card.pdf or b"") + sum(len(photo.data) for photo in card.photos) for card in cards
@@ -174,15 +176,25 @@ def _encode_catalog(
         raise ValueError("Неизвестная область архива.")
     review.validate(ledger, assets, scope)
     funds.validate(ledger, review)
+    directory.validate()
     content = items
-    if assets or scope != "legacy" or review != Review() or funds != Funds():
-        content = {"cards": items, "assets": [asdict(asset) for asset in assets]}
+    if assets or scope != "legacy" or review != Review() or funds != Funds() or directory != Directory():
+        records = []
+        for asset in assets:
+            record = asdict(asset)
+            for key in ("ticker", "quantity", "purchase_cost"):
+                if record[key] is None or record[key] == "":
+                    record.pop(key)
+            records.append(record)
+        content = {"cards": items, "assets": records}
         if ledger.openings:
             content["ledger"] = ledger.to_payload()
         if review != Review():
             content["review"] = review.to_payload()
         if funds != Funds():
             content["funds"] = funds.to_payload()
+        if directory != Directory():
+            content["directory"] = directory.to_payload()
         if scope != "legacy":
             content["scope"] = scope
     payload = json.dumps(content, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
@@ -193,13 +205,13 @@ def _encode_catalog(
 
 def decode_catalog(
     payload: bytes,
-) -> tuple[tuple[Card, ...], tuple[Asset, ...], Ledger, Review, Funds, str]:
+) -> tuple[tuple[Card, ...], tuple[Asset, ...], Ledger, Review, Funds, Directory, str]:
     try:
         content = json.loads(payload)
         assets = []
         ledger = Ledger()
-        review, funds, scope = Review(), Funds(), "legacy"
-        optional_sections = {"ledger", "review", "funds", "scope"}
+        review, funds, directory, scope = Review(), Funds(), Directory(), "legacy"
+        optional_sections = {"ledger", "review", "funds", "directory", "scope"}
         if isinstance(content, dict) and set(content) - optional_sections == {"cards", "assets"}:
             items = content["cards"]
             if "ledger" in content:
@@ -208,6 +220,8 @@ def decode_catalog(
                 review = Review.from_payload(content["review"])
             if "funds" in content:
                 funds = Funds.from_payload(content["funds"])
+            if "directory" in content:
+                directory = Directory.from_payload(content["directory"])
             scope = content.get("scope", "legacy")
             if scope not in SCOPES:
                 raise ValueError("Неизвестная область архива.")
@@ -250,7 +264,8 @@ def decode_catalog(
         ledger.validate(tuple(assets))
         review.validate(ledger, tuple(assets), scope)
         funds.validate(ledger, review)
-        return tuple(cards), tuple(assets), ledger, review, funds, scope
+        directory.validate()
+        return tuple(cards), tuple(assets), ledger, review, funds, directory, scope
     except (ValueError, TypeError, KeyError, UnicodeError) as exc:
         raise ValueError("Не удалось прочитать карточки архива.") from exc
 
@@ -273,6 +288,7 @@ class Catalog:
     review: Review = Review()
     funds: Funds = Funds()
     scope: str = "legacy"
+    directory: Directory = Directory()
 
     @classmethod
     def open(cls, path: Path, password: str) -> "Catalog":
@@ -282,25 +298,26 @@ class Catalog:
         if magic == MAGIC:
             return cls(path, (Card("Тестовый документ", pdf=payload, archive_number=1),),
                        hashlib.sha256(data).digest(), unlocked)
-        cards, assets, ledger, review, funds, scope = decode_catalog(payload)
+        cards, assets, ledger, review, funds, directory, scope = decode_catalog(payload)
         if scope in ("personal", "business") and path.stat().st_uid != os.getuid():
             raise ValueError("Личный архив и архив ИП открываются из учётной записи владельца.")
-        return cls(path, cards, hashlib.sha256(data).digest(), unlocked, assets, ledger, review, funds, scope)
+        return cls(path, cards, hashlib.sha256(data).digest(), unlocked, assets, ledger, review, funds, scope, directory)
 
     @classmethod
     def create(
         cls, path: Path, password: str, *, cards: tuple[Card, ...] = (),
         assets: tuple[Asset, ...] = (), ledger: Ledger = Ledger(),
         review: Review = Review(), funds: Funds = Funds(), scope: str = "legacy",
+        directory: Directory = Directory(),
     ) -> "Catalog":
         path = path.parent.resolve() / path.name
         cards = tuple(replace(card, archive_number=index) for index, card in enumerate(cards, start=1))
         unlocked = UnlockedVault.create(password)
         assets = tuple(replace(asset, asset_number=index) for index, asset in enumerate(assets, start=1))
-        data = unlocked.encrypt(_encode_catalog(cards, assets, ledger, review, funds, scope), DOCUMENT_MAGIC)
+        data = unlocked.encrypt(_encode_catalog(cards, assets, ledger, review, funds, directory, scope), DOCUMENT_MAGIC)
         group = group_for_directory(path) if scope == "family" else None
         _write_new(path, data, group=group)
-        return cls(path, cards, hashlib.sha256(data).digest(), unlocked, assets, ledger, review, funds, scope)
+        return cls(path, cards, hashlib.sha256(data).digest(), unlocked, assets, ledger, review, funds, scope, directory)
 
     def add(self, card: Card) -> "Catalog":
         number = max((existing.archive_number for existing in self.cards), default=0) + 1
@@ -374,6 +391,86 @@ class Catalog:
     def save_review(self, review: Review) -> "Catalog":
         return self._save(self.cards, self.assets, review=review)
 
+    def save_directory(self, directory: Directory, review: Review) -> "Catalog":
+        return self._save(self.cards, self.assets, review=review, directory=directory)
+
+    def _manual_opening(self, ledger: Ledger, account: int, day: str, prior: int | None) -> Ledger:
+        asset = next((asset for asset in self.assets if asset.asset_number == account
+                      and asset.category == "account" and asset.status == "active"), None)
+        if asset is None:
+            raise ValueError("Выберите действующий счёт или кошелёк.")
+        earliest = date.fromisoformat(_day(day))
+        if earliest == date.min:
+            raise ValueError("Выберите более позднюю дату операции.")
+        opening = ledger.opening(account)
+        if opening is not None:
+            if day > opening.day:
+                return ledger
+            if opening.flexible:
+                moved = replace(opening, day=(earliest - timedelta(days=1)).isoformat())
+                return replace(ledger, openings=tuple(moved if item.account == account else item
+                                                     for item in ledger.openings))
+            raise ValueError(f"Вводите операции после {opening.day}: это дата начального остатка счёта.")
+        if prior is None and asset.amount is not None and asset.as_of < day:
+            return ledger.set_opening(Opening(account, asset.as_of, asset.amount, asset.currency))
+        if prior is None and asset.amount is not None:
+            raise ValueError("Укажите остаток непосредственно перед операцией: дата оценки счёта совпадает с ней или позже.")
+        start = (earliest - timedelta(days=1)).isoformat()
+        return ledger.set_opening(Opening(account, start, prior or 0, asset.currency,
+                                         flexible=asset.amount is None and not prior))
+
+    def record_manual(self, entry: Entry, category: str = "", *, prior: int | None = None,
+                      number: int | None = None, taxable: bool = False,
+                      fund: int | None = None) -> "Catalog":
+        if entry.source != "manual":
+            raise ValueError("Ручной ввод принимает только ручные операции.")
+        ledger, review = self.ledger, self.review
+        if number is not None:
+            if fund is not None:
+                raise ValueError("Привяжите уже записанный расход через движения фонда.")
+            if not 1 <= number <= len(ledger.entries):
+                raise ValueError("Операция не найдена.")
+            old = ledger.entries[number - 1]
+            if old.source != "manual" or number in review.linked or any(
+                move.operation == number for move in self.funds.movements
+            ):
+                raise ValueError("Для этой операции доступны статьи в разделе разбора. Денежные движения связаны с другими записями.")
+        ledger = self._manual_opening(ledger, entry.account, entry.day, prior)
+        if number is None:
+            ledger = ledger.add_manual(entry)
+            number = len(ledger.entries)
+        else:
+            ledger = replace(ledger, entries=(*ledger.entries[:number - 1], entry, *ledger.entries[number:]))
+        category = " ".join(category.split())
+        if category:
+            if len(category) > 100:
+                raise ValueError("Название статьи должно содержать не более 100 символов.")
+            found = self.directory.lookup(1 if entry.amount > 0 else -1, category)
+            if found is not None:
+                previous = review.assignments_by_operation().get(number)
+                if found.archived and (previous is None or previous.category != found.name):
+                    raise ValueError("Эта статья в архиве. Выберите действующую или верните её в справочнике.")
+                category = found.name
+            review = review.assign((Assignment(number, category, taxable),))
+        else:
+            review = replace(review, assignments=tuple(item for item in review.assignments
+                                                       if item.operation != number))
+        funds = self.funds
+        if fund is not None:
+            if entry.amount >= 0:
+                raise ValueError("Из фонда можно списать только расход.")
+            funds = funds.apply(f"expense:{number}", ((fund, entry.amount),), number)
+        return self._save(self.cards, self.assets, ledger, review=review, funds=funds)
+
+    def record_transfer(self, debit: Entry, credit: Entry, *, debit_prior: int | None = None,
+                        credit_prior: int | None = None) -> "Catalog":
+        ledger = self._manual_opening(self.ledger, debit.account, debit.day, debit_prior)
+        ledger = self._manual_opening(ledger, credit.account, credit.day, credit_prior)
+        debit_number = len(ledger.entries) + 1
+        ledger = ledger.add_manual(debit).add_manual(credit)
+        review = self.review.link_transfer(ledger, debit_number, debit_number + 1)
+        return self._save(self.cards, self.assets, ledger, review=review)
+
     def save_funds(self, funds: Funds) -> "Catalog":
         return self._save(self.cards, self.assets, funds=funds)
 
@@ -429,13 +526,14 @@ class Catalog:
 
     def _save(
         self, cards: tuple[Card, ...], assets: tuple[Asset, ...], ledger: Ledger | None = None,
-        *, review: Review | None = None, funds: Funds | None = None,
+        *, review: Review | None = None, funds: Funds | None = None, directory: Directory | None = None,
     ) -> "Catalog":
         self._check_editable()
         ledger = self.ledger if ledger is None else ledger
         review = self.review if review is None else review
         funds = self.funds if funds is None else funds
-        payload = _encode_catalog(cards, assets, ledger, review, funds, self.scope)
+        directory = self.directory if directory is None else directory
+        payload = _encode_catalog(cards, assets, ledger, review, funds, directory, self.scope)
         group = self.shared_group
         lock_path = self.path.with_name(f".{self.path.name}.lock")
         flags = os.O_RDWR | os.O_NOFOLLOW
@@ -468,5 +566,5 @@ class Catalog:
                     os.replace(temporary, self.path)
                 finally:
                     temporary.unlink(missing_ok=True)
-        return replace(self, cards=cards, assets=assets, ledger=ledger, review=review, funds=funds,
+        return replace(self, cards=cards, assets=assets, ledger=ledger, review=review, funds=funds, directory=directory,
                        revision=hashlib.sha256(data).digest())

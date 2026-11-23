@@ -15,7 +15,7 @@ from documents import Catalog
 
 
 class AssetEditor(QDialog):
-    def __init__(self, parent, catalog: Catalog, asset: Asset | None):
+    def __init__(self, parent, catalog: Catalog, asset: Asset | None, *, initial_category="account"):
         super().__init__(parent)
         self.setWindowTitle("Изменить карточку" if asset else "Новый счёт или актив")
         self.resize(780, 595)
@@ -44,11 +44,16 @@ class AssetEditor(QDialog):
         self.category = ChoiceBox()
         for key, title in CATEGORIES.items():
             self.category.addItem(title, key)
-        self.category.setCurrentIndex(self.category.findData(asset.category if asset else "account"))
+        self.category.setCurrentIndex(self.category.findData(asset.category if asset else initial_category))
         self.category.setAccessibleName("Категория")
         self.category.toggle.setAccessibleName("Открыть категории")
         self.category.currentIndexChanged.connect(self.kind_hint)
         self.kind_hint()
+        self.ticker = QLineEdit(asset.ticker if asset else "")
+        self.quantity = QLineEdit(asset.quantity if asset else "")
+        self.purchase_cost = QLineEdit(
+            amount_text(asset.purchase_cost) if asset and asset.purchase_cost is not None else ""
+        )
         self.status = ChoiceBox()
         for key, title in STATUSES.items():
             self.status.addItem(title, key)
@@ -83,6 +88,14 @@ class AssetEditor(QDialog):
         form.addRow("Статус", self.status)
         form.addRow("Остаток / оценка", money)
         form.addRow("На дату", self.as_of)
+        form.addRow("Тикер", self.ticker)
+        form.addRow("Количество", self.quantity)
+        form.addRow("Затраты на покупку", self.purchase_cost)
+        def show_investment_fields():
+            for field in (self.ticker, self.quantity, self.purchase_cost):
+                form.setRowVisible(field, self.category.currentData() == "investment")
+        self.category.currentIndexChanged.connect(show_investment_fields)
+        show_investment_fields()
         if self.ledger_managed:
             form.addRow("", label("Остаток рассчитывается по журналу операций.", "small", wrap=True))
         form.addRow("Путь в KeePassXC", self.pointer)
@@ -137,6 +150,7 @@ class AssetEditor(QDialog):
             if self.cards.item(row).checkState() == Qt.CheckState.Checked
         )
         try:
+            investment = self.category.currentData() == "investment"
             asset = Asset(
                 title=self.title.text().strip(), category=self.category.currentData(), owner=self.owner.text().strip(),
                 kind=self.kind.text().strip(), organization=self.organization.text().strip(),
@@ -145,6 +159,9 @@ class AssetEditor(QDialog):
                 currency=self.currency.text().strip().upper(),
                 as_of=self.original.as_of if self.ledger_managed else self.as_of.text().strip(),
                 access_pointer=self.pointer.text().strip(), document_numbers=numbers,
+                ticker=self.ticker.text().strip().upper() if investment else "",
+                quantity=self.quantity.text().strip() if investment else "",
+                purchase_cost=parse_amount(self.purchase_cost.text()) if investment else None,
             )
             asset.validate(self.documents)
         except ValueError as exc:
@@ -277,6 +294,10 @@ class RegistryDialog(QDialog):
             ]
             if asset.organization:
                 details.append(f"Банк / организация: {asset.organization}")
+            if asset.ticker or asset.quantity:
+                details.append(" · ".join(filter(None, (asset.ticker, asset.quantity))))
+            if asset.purchase_cost is not None:
+                details.append(f"Затраты на покупку: {amount_text(asset.purchase_cost)} {asset.currency}")
             valuation = asset.valuation
             if asset.as_of:
                 valuation = f"{valuation} на {asset.as_of}"

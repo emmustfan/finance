@@ -57,9 +57,19 @@ class CategoryDialog(QDialog):
         entry = catalog.ledger.entries[number - 1]
         review = catalog.review
         previous = review.assignments_by_operation().get(number)
-        suggestion = review.suggestion(entry)
+        suggestion = catalog.directory.suggestion(review, entry)
         category = previous.category if previous else suggestion.category if suggestion else ""
-        layout, form, edits = inputs(self, "Подтвердить статью", (("category", "Статья", category),))
+        layout, form, _ = inputs(self, "Подтвердить статью", ())
+        self.category_choice = ChoiceBox()
+        self.category_choice.setEditable(True)
+        self.category_choice.toggle.raise_()
+        self.category_choice.addItem("")
+        self.category_choice.addItems([
+            item.name for item in catalog.directory.effective(catalog.ledger, review)
+            if item.direction == (1 if entry.amount > 0 else -1) and not item.archived
+        ])
+        self.category_choice.setCurrentText(category)
+        form.addRow("Статья или источник", self.category_choice)
         if suggestion:
             layout.addWidget(label(suggestion.reason, "muted", wrap=True))
         self.taxable = QCheckBox("Облагаемое поступление ИП для резерва 6%")
@@ -75,10 +85,15 @@ class CategoryDialog(QDialog):
                 self.rule.addItem(f"{title}: {value}", field)
         form.addRow("Правило на будущее", self.rule)
         def save():
-            value = edits["category"].text().strip()
-            if not value:
-                QMessageBox.warning(self, "Статья", "Введите статью дохода или расхода.")
+            value = self.category_choice.currentText().strip()
+            if not value or len(value) > 100:
+                QMessageBox.warning(self, "Статья", "Введите статью дохода или расхода до 100 символов.")
                 return
+            found = catalog.directory.lookup(1 if entry.amount > 0 else -1, value)
+            if found and found.archived and (previous is None or previous.category != found.name):
+                QMessageBox.warning(self, "Статья", "Верните её в справочнике или выберите действующую статью.")
+                return
+            value = found.name if found else value
             updated = review.assign((Assignment(number, value, self.taxable.isChecked()),))
             field = self.rule.currentData()
             if field:
@@ -238,7 +253,7 @@ class ReviewDialog(QDialog):
                 status = "Возможный перевод"
                 reason = ("Ожидает вторую сторону" if not review.transfer_candidates(ledger, number)
                           else "Доступны пары · «Перевод…»")
-            elif suggestion := review.suggestion(entry):
+            elif suggestion := self.catalog.directory.suggestion(review, entry):
                 status = suggestion.category
                 reason = suggestion.reason
                 if suggestion.difference:
@@ -339,7 +354,7 @@ class ReviewDialog(QDialog):
             entry = ledger.entries[number - 1]
             if number in excluded or any(word in _normalized(entry.description) for word in TRANSFER_WORDS):
                 continue
-            if suggestion := review.suggestion(entry):
+            if suggestion := self.catalog.directory.suggestion(review, entry):
                 rows.append((number, entry, suggestion))
         if not rows:
             QMessageBox.information(self, "Статьи", "В этом периоде нет предложений для подтверждения.")
@@ -383,9 +398,11 @@ class ReviewDialog(QDialog):
         fill_table(grid, [(*key, amount_text(value)) for key, value in sorted(totals.items())])
         layout.addWidget(grid, 1)
         revenue, reserve = review.tax_reserve(ledger, start, end)
+        tax_category = self.catalog.directory.lookup(-1, TAX_PAYMENT)
+        tax_name = tax_category.name if tax_category else TAX_PAYMENT
         layout.addWidget(label(
             f"Отмеченные поступления ИП: {amount_text(revenue)} RUB · Ориентир резерва 6%: {amount_text(reserve)} RUB\n"
-            f"Проведённые налоги и взносы: {amount_text(totals.get(('RUB', 'Расходы', TAX_PAYMENT), 0))} RUB",
+            f"Проведённые налоги и взносы: {amount_text(totals.get(('RUB', 'Расходы', tax_name), 0))} RUB",
             "sectionTitle", wrap=True,
         ))
         close_bar(dialog, layout)

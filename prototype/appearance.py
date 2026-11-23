@@ -41,6 +41,15 @@ QLabel#sectionTitle { color: #25374B; font-size: 13px; font-weight: 700; }
 QLabel#muted { color: #53657D; }
 QLabel#small { color: #53657D; font-size: 11px; }
 QLabel#count { color: #52657A; background: #F0F3F7; border-radius: 8px; padding: 3px 7px; font-size: 11px; }
+QFrame#financeMetric { background: #F3F7F6; border: 1px solid #DEEAE5; border-radius: 11px; }
+QLabel#financeValue, QLabel#financePositive, QLabel#financeExpense { font-size: 21px; font-weight: 700; }
+QLabel#financePositive { color: #146951; }
+QLabel#financeExpense, QLabel#financeError { color: #9E3940; }
+QTabWidget#financeTabs::pane { border: 1px solid #DEE6EC; border-radius: 10px; }
+QTabWidget#financeTabs QTabBar::tab { padding: 9px 14px; margin-right: 4px; color: #465970; }
+QTabWidget#financeTabs QTabBar::tab:selected { color: #146951; border-bottom: 2px solid #146951; font-weight: 700; }
+QProgressBar { background: #EAF2EF; border: 0; border-radius: 7px; text-align: center; color: #162D27; }
+QProgressBar::chunk { background: #A6DCC8; border-radius: 7px; }
 QLabel#rowTitle { color: #203146; font-weight: 700; }
 QPushButton, QToolButton {
     color: #25374B; background: #FFFFFF; border: 1px solid #DCE3EC;

@@ -2,8 +2,9 @@
 
 import re
 from dataclasses import asdict, dataclass, replace
+from datetime import date
 
-from ledger import Ledger
+from ledger import Ledger, _day
 from review import Review, operation
 
 FUND_KINDS = ("Обязательные платежи", "Подушка", "Цель", "Инвестиции", "Налоговый резерв ИП")
@@ -17,6 +18,20 @@ class Fund:
     currency: str
     goal: int | None = None
     number: int = 0
+    deadline: str = ""
+
+
+def goal_gap(fund: Fund, saved: int, today: date) -> tuple[int, int | None]:
+    if fund.goal is None:
+        raise ValueError("Сначала укажите сумму цели.")
+    gap = max(0, fund.goal - saved)
+    if not gap or not fund.deadline:
+        return gap, None
+    deadline = date.fromisoformat(fund.deadline)
+    if deadline < today:
+        return gap, None
+    months = (deadline.year - today.year) * 12 + deadline.month - today.month + 1
+    return gap, (gap + months - 1) // months
 
 
 @dataclass(frozen=True)
@@ -47,7 +62,11 @@ class Funds:
     templates: tuple[Template, ...] = ()
 
     def to_payload(self) -> dict:
-        return asdict(self)
+        payload = asdict(self)
+        for fund in payload["funds"]:
+            if not fund["deadline"]:
+                del fund["deadline"]
+        return payload
 
     @classmethod
     def from_payload(cls, payload: dict) -> "Funds":
@@ -106,10 +125,15 @@ class Funds:
             if (
                 type(fund.number) is not int or fund.number < 1 or fund.number in numbers
                 or not isinstance(fund.title, str) or not fund.title.strip() or fund.kind not in FUND_KINDS
+                or not isinstance(fund.deadline, str)
                 or not isinstance(fund.currency, str) or not re.fullmatch("[A-Z]{3}", fund.currency)
                 or (fund.goal is not None and (type(fund.goal) is not int or fund.goal <= 0))
             ):
                 raise ValueError("Заполните название, вид, валюту и положительную цель фонда.")
+            if fund.deadline:
+                if fund.goal is None:
+                    raise ValueError("Чтобы задать срок, укажите сумму цели.")
+                _day(fund.deadline)
             numbers.add(fund.number)
         self.check_templates()
         balances = dict.fromkeys(numbers, 0)

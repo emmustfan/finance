@@ -1,7 +1,6 @@
 """Account operations, CSV review and balance comparison."""
 
 from collections import Counter
-from datetime import date
 from pathlib import Path
 
 from PySide6.QtCore import Qt
@@ -13,7 +12,8 @@ from PySide6.QtWidgets import (
 from appearance import ChoiceBox, button, label
 from assets import Asset, amount_text, parse_amount
 from documents import Catalog
-from ledger import Entry, Ledger, Opening, Statement, _normalized, preview_import, read_statement
+from finance_editors import OperationEditor
+from ledger import Ledger, Opening, Statement, _normalized, preview_import, read_statement
 
 FIELDS = {
     "date": "Дата", "amount": "Сумма со знаком", "description": "Описание",
@@ -282,7 +282,8 @@ class LedgerDialog(QDialog):
         self.opening_button.setEnabled(number is not None and self.catalog.editable)
         self.import_button.setEnabled(bool(ledger.openings) and self.catalog.editable)
         latest = ledger.latest_balance(number)
-        self.manual_button.setEnabled(latest is not None and self.catalog.editable)
+        self.manual_button.setEnabled(number is not None and self.accounts[number].status == "active"
+                                      and self.catalog.editable)
         self.check_button.setEnabled(latest is not None)
         self.bank_summary.clear()
         self.grid.setRowCount(0)
@@ -290,7 +291,7 @@ class LedgerDialog(QDialog):
             self.summary.setText("Добавьте банковский счёт в разделе «Счета и активы».")
             return
         if latest is None:
-            self.summary.setText("Задайте начальный остаток, чтобы начать учёт по этому счёту.")
+            self.summary.setText("Добавьте первую операцию. Начальный остаток можно указать в той же форме.")
             return
         amount, day = latest
         currency = self.accounts[number].currency
@@ -352,25 +353,10 @@ class LedgerDialog(QDialog):
 
     def add_manual(self) -> None:
         number = self.account.currentData()
-        values = DetailsDialog(self, "Ручная операция", "Укажите отрицательную сумму для списания.",
-            (
-                ("day", "Дата", date.today().isoformat(), "ГГГГ-ММ-ДД"),
-                ("amount", "Сумма", "", "−300,00"),
-                ("description", "Описание", "", "Например, покупка продуктов"),
-                ("recipient", "Получатель", "", "Необязательно"),
-            ),
-        ).values()
-        if values is None:
-            return
-        try:
-            amount = parse_amount(values["amount"])
-            if not amount:
-                raise ValueError("Укажите ненулевую сумму.")
-            self.save(self.catalog.ledger.add_manual(
-                Entry(number, values["day"], amount, values["description"], recipient=values["recipient"])
-            ))
-        except ValueError as exc:
-            self.error(exc)
+        dialog = OperationEditor(self, self.catalog, account=number)
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            self.catalog = dialog.catalog
+            self.refresh()
 
     def reconcile(self) -> None:
         number = self.account.currentData()

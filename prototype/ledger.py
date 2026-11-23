@@ -66,6 +66,7 @@ class Opening:
     amount: int
     currency: str
     reference: str = ""
+    flexible: bool = False
 
 
 @dataclass(frozen=True)
@@ -106,7 +107,11 @@ class Ledger:
     balances: tuple[BankBalance, ...] = ()
 
     def to_payload(self) -> dict:
-        return asdict(self)
+        payload = asdict(self)
+        for opening in payload["openings"]:
+            if not opening["flexible"]:
+                del opening["flexible"]
+        return payload
 
     @classmethod
     def from_payload(cls, payload: dict) -> "Ledger":
@@ -123,7 +128,8 @@ class Ledger:
             if (
                 type(opening.account) is not int or opening.account in openings or asset is None
                 or opening.currency != asset.currency or type(opening.amount) is not int
-                or not isinstance(opening.reference, str)
+                or not isinstance(opening.reference, str) or type(opening.flexible) is not bool
+                or (opening.flexible and opening.amount != 0)
             ):
                 raise ValueError("Учет требует существующего счёта с прежней валютой.")
             _day(opening.day)

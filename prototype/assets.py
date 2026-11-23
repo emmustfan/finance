@@ -10,8 +10,8 @@ CATEGORIES = {
     "property": "Имущество",
 }
 KINDS = {
-    "account": ("Текущий счёт", "Накопительный счёт", "Вклад", "Счёт ИП"),
-    "investment": ("Брокерский счёт", "ИИС", "Доля в бизнесе"),
+    "account": ("Текущий счёт", "Накопительный счёт", "Наличные", "Вклад", "Счёт ИП"),
+    "investment": ("Акции", "Облигации", "Фонд", "Брокерский счёт", "ИИС", "Доля в бизнесе"),
     "property": ("Квартира", "Дом", "Земельный участок", "Автомобиль"),
 }
 STATUSES = {"active": "Действует", "inactive": "Закрыт или выбыл"}
@@ -51,11 +51,14 @@ class Asset:
     access_pointer: str = ""
     document_numbers: tuple[int, ...] = ()
     asset_number: int = 0
+    ticker: str = ""
+    quantity: str = ""
+    purchase_cost: int | None = None
 
     def validate(self, documents: set[int]) -> None:
         if not all(isinstance(value, str) for value in (
             self.title, self.category, self.owner, self.kind, self.organization,
-            self.status, self.currency, self.as_of, self.access_pointer,
+            self.status, self.currency, self.as_of, self.access_pointer, self.ticker, self.quantity,
         )):
             raise ValueError("В карточке актива есть некорректные поля.")
         if not self.title.strip() or not self.owner.strip():
@@ -77,6 +80,18 @@ class Asset:
                     raise ValueError()
             except ValueError as exc:
                 raise ValueError("Укажите дату в формате ГГГГ-ММ-ДД.") from exc
+        if self.ticker or self.quantity or self.purchase_cost is not None:
+            if self.category != "investment":
+                raise ValueError("Тикер, количество и затраты относятся к инвестиционной позиции.")
+            if self.quantity and (
+                not re.fullmatch(r"[0-9]{1,12}(?:[.,][0-9]{1,8})?", self.quantity)
+                or not any(character in "123456789" for character in self.quantity)
+            ):
+                raise ValueError("Количество должно быть положительным числом, например 10 или 2,5.")
+            if self.purchase_cost is not None and (
+                type(self.purchase_cost) is not int or not 0 <= self.purchase_cost < 10**17
+            ):
+                raise ValueError("Укажите неотрицательную стоимость покупки.")
         if (
             not all(type(number) is int and number in documents for number in self.document_numbers)
             or len(set(self.document_numbers)) != len(self.document_numbers)
@@ -89,7 +104,7 @@ class Asset:
 
     def matches(self, query: str) -> bool:
         searchable = " ".join((
-            self.title, self.owner, self.kind, self.organization, CATEGORIES[self.category],
+            self.title, self.owner, self.kind, self.organization, self.ticker, CATEGORIES[self.category],
         )).casefold()
         return all(part in searchable for part in query.casefold().split())
 

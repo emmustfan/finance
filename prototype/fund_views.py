@@ -174,6 +174,7 @@ class FundsDialog(QDialog):
             ("title", "Название", old.title if old else ""),
             ("currency", "Валюта", old.currency if old else "RUB"),
             ("goal", "Цель (необязательно)", amount_text(old.goal) if old and old.goal else ""),
+            ("deadline", "Срок (ГГГГ-ММ-ДД)", old.deadline if old else ""),
         ))
         kind = ChoiceBox()
         kind.addItems(FUND_KINDS)
@@ -184,7 +185,8 @@ class FundsDialog(QDialog):
             try:
                 goal = parse_amount(fields["goal"].text())
                 fund = Fund(fields["title"].text().strip(), kind.currentText(),
-                            fields["currency"].text().strip().upper(), goal, old.number if old else 0)
+                            fields["currency"].text().strip().upper(), goal, old.number if old else 0,
+                            fields["deadline"].text().strip())
                 if self.save(self.catalog.funds.save_fund(fund)):
                     dialog.accept()
             except ValueError as exc:

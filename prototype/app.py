@@ -25,7 +25,8 @@ from appearance import ChoiceBox, TagEditor, TagFlow, apply_style, area, button,
 from asset_views import RegistryDialog, launch_keepass
 from assets import Asset
 from documents import CARD_FIELDS, MAX_ATTACHMENT_BYTES, SCOPES, Card, Catalog, Photo, read_pdf, read_photo, tag_names
-from fund_views import FundsDialog, OverviewDialog
+from finance_views import FinanceDialog
+from fund_views import FundsDialog
 from funds import Fund, Funds, Line, Template
 from ledger import Ledger, Opening
 from ledger_views import LedgerDialog
@@ -617,8 +618,8 @@ class ArchiveWindow(QMainWindow):
         layout.addWidget(self.archive_hint)
         layout.addWidget(button("Открыть архив…", self.open_archive, sidebar=True))
         layout.addWidget(button("Новый архив…", lambda: self.create_archive(False), sidebar=True))
-        self.overview_button = button("Обзор…", self.open_overview, sidebar=True)
-        layout.addWidget(self.overview_button)
+        self.finance_button = button("Финансы…", self.open_finance, sidebar=True)
+        layout.addWidget(self.finance_button)
         self.folders_button = button("Бумажные папки…", self.open_folders, sidebar=True)
         layout.addWidget(self.folders_button)
         self.assets_button = button("Счета и активы…", self.open_registry, sidebar=True)
@@ -848,7 +849,7 @@ class ArchiveWindow(QMainWindow):
         self.folders_button.setEnabled(catalog is not None)
         self.assets_button.setEnabled(catalog is not None)
         self.operations_button.setEnabled(catalog is not None)
-        self.overview_button.setEnabled(catalog is not None)
+        self.finance_button.setEnabled(catalog is not None)
         self.review_button.setEnabled(catalog is not None)
         self.funds_button.setEnabled(catalog is not None)
         self.add_button.setEnabled(catalog is not None and catalog.editable)
@@ -880,9 +881,13 @@ class ArchiveWindow(QMainWindow):
             dialog.exec()
             self.catalog = dialog.catalog
 
-    def open_overview(self) -> None:
+    def open_finance(self) -> None:
         if self.catalog is not None:
-            OverviewDialog(self, self.catalog).exec()
+            dialog = FinanceDialog(self, self.catalog)
+            dialog.exec()
+            self.catalog = dialog.catalog
+            if dialog.document_number is not None:
+                self.show_document(dialog.document_number)
 
     def open_review(self) -> None:
         if self.catalog is not None:
