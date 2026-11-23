@@ -13,11 +13,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - runner: macos-15
-            arch: arm64
-          - runner: macos-15-intel
-            arch: x86_64
+        include: ${{ fromJSON(startsWith(github.ref_name, 'finance-test-intel-') && '[{"runner":"macos-15-intel","arch":"x86_64"}]' || '[{"runner":"macos-15","arch":"arm64"},{"runner":"macos-15-intel","arch":"x86_64"}]') }}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 25
     steps:
@@ -29,19 +25,30 @@ jobs:
         run: |
           test "$(uname -m)" = "${{ matrix.arch }}"
           bash prototype/build-macos.sh
-      - name: Test and install
+      - name: Run archive tests
         run: |
-          prototype/.venv/bin/python -m unittest discover -s prototype -v
-          sudo /usr/sbin/installer -pkg prototype/dist/FinanceArchive.pkg -target /
-          QT_QPA_PLATFORM=offscreen prototype/.venv/bin/python - <<'PY'
+          set -o pipefail
+          prototype/.venv/bin/python -m unittest discover -s prototype -v 2>&1 | tee "${RUNNER_TEMP}/finance-tests.log"
+      - name: Install the package
+        run: |
+          set -o pipefail
+          sudo /usr/sbin/installer -pkg prototype/dist/FinanceArchive.pkg -target / 2>&1 | tee "${RUNNER_TEMP}/finance-install.log"
+      - name: Launch the installed app
+        run: |
+          set -o pipefail
+          QT_QPA_PLATFORM=offscreen prototype/.venv/bin/python - <<'PY' 2>&1 | tee "${RUNNER_TEMP}/finance-launch.log"
           from subprocess import Popen, TimeoutExpired
 
           with Popen(["/Applications/FinanceArchive.app/Contents/MacOS/FinanceArchive"]) as app:
               try:
-                  status = app.wait(timeout=5)
+                  status = app.wait(timeout=8)
               except TimeoutExpired:
                   app.terminate()
-                  app.wait(timeout=5)
+                  try:
+                      app.wait(timeout=15)
+                  except TimeoutExpired:
+                      app.kill()
+                      app.wait()
               else:
                   raise SystemExit(f"App closed during startup: {status}")
           PY
@@ -51,3 +58,11 @@ jobs:
           name: FinanceArchive-macOS-${{ matrix.arch }}
           path: prototype/dist/FinanceArchive.pkg
           if-no-files-found: error
+      - name: Show failing stage details
+        if: failure()
+        run: |
+          for log in "${RUNNER_TEMP}"/finance-*.log; do
+            if test -f "$log"; then
+              { printf '### %s\n\n```text\n' "$(basename "$log")"; tail -55 "$log"; printf '```\n\n'; } >> "$GITHUB_STEP_SUMMARY"
+            fi
+          done
