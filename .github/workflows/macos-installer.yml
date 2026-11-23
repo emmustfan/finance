@@ -1,0 +1,53 @@
+name: macOS installer
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'finance-test-*'
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            arch: arm64
+          - runner: macos-15-intel
+            arch: x86_64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Build the installer
+        run: |
+          test "$(uname -m)" = "${{ matrix.arch }}"
+          bash prototype/build-macos.sh
+      - name: Test and install
+        run: |
+          prototype/.venv/bin/python -m unittest discover -s prototype -v
+          sudo /usr/sbin/installer -pkg prototype/dist/FinanceArchive.pkg -target /
+          QT_QPA_PLATFORM=offscreen prototype/.venv/bin/python - <<'PY'
+          from subprocess import Popen, TimeoutExpired
+
+          with Popen(["/Applications/FinanceArchive.app/Contents/MacOS/FinanceArchive"]) as app:
+              try:
+                  status = app.wait(timeout=5)
+              except TimeoutExpired:
+                  app.terminate()
+                  app.wait(timeout=5)
+              else:
+                  raise SystemExit(f"App closed during startup: {status}")
+          PY
+      - name: Upload the local test installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: FinanceArchive-macOS-${{ matrix.arch }}
+          path: prototype/dist/FinanceArchive.pkg
+          if-no-files-found: error
