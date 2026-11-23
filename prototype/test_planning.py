@@ -121,6 +121,26 @@ class PlanningTest(unittest.TestCase):
         )))
         self.assertEqual(funds.plan("RUB", 10000, 9000), ((1, 500), (2, 2500), (3, 3000), (4, 3000)))
 
+    def test_transfer_from_business_to_personal_does_not_create_revenue_twice(self):
+        path = self.root / "scope.fvault"
+        catalog = Catalog.create(path, PASSWORD, assets=(
+            Asset("Счёт ИП", "account", "Анна", kind="Счёт ИП"),
+            Asset("Личный счёт", "account", "Анна"),
+        ), ledger=Ledger(
+            openings=(Opening(1, "2026-10-31", 0, "RUB"), Opening(2, "2026-10-31", 0, "RUB")),
+            entries=(
+                Entry(1, "2026-11-01", 5_000_000, "Выручка"),
+                Entry(1, "2026-11-03", -1_000_000, "Перевод на свой счёт"),
+                Entry(2, "2026-11-03", 1_000_000, "Пополнение личного счёта"),
+            ),
+        ))
+        review = Review().assign((Assignment(1, "Выручка ИП", True), Assignment(3, "Доход")))
+        catalog = catalog.save_review(review.link_transfer(catalog.ledger, 2, 3))
+        self.assertEqual(catalog.review.report(catalog.ledger, "2026-11-01", "2026-11-30"),
+                         {("RUB", "Доходы", "Выручка ИП"): 5_000_000})
+        self.assertEqual(catalog.review.tax_reserve(catalog.ledger, "2026-11-01", "2026-11-30"),
+                         (5_000_000, 300_000))
+
     def test_explicit_archive_scope_and_family_group_file_modes(self):
         shared = self.root / "shared"
         shared.mkdir()

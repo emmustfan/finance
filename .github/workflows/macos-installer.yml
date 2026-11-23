@@ -25,10 +25,6 @@ jobs:
         run: |
           test "$(uname -m)" = "${{ matrix.arch }}"
           bash prototype/build-macos.sh
-      - name: Run archive tests
-        run: |
-          set -o pipefail
-          prototype/.venv/bin/python -m unittest discover -s prototype -v 2>&1 | tee "${RUNNER_TEMP}/finance-tests.log"
       - name: Install the package
         run: |
           set -o pipefail
@@ -36,22 +32,41 @@ jobs:
       - name: Launch the installed app
         run: |
           set -o pipefail
-          QT_QPA_PLATFORM=offscreen prototype/.venv/bin/python - <<'PY' 2>&1 | tee "${RUNNER_TEMP}/finance-launch.log"
-          from subprocess import Popen, TimeoutExpired
+          prototype/.venv/bin/python - <<'PY' 2>&1 | tee "${RUNNER_TEMP}/finance-launch.log"
+          from os import environ
+          from subprocess import Popen, PIPE, STDOUT, TimeoutExpired, run
 
-          with Popen(["/Applications/FinanceArchive.app/Contents/MacOS/FinanceArchive"]) as app:
+          binary = "/Applications/FinanceArchive.app/Contents/MacOS/FinanceArchive"
+          diagnostics = []
+          for platform in ("offscreen", "cocoa"):
               try:
-                  status = app.wait(timeout=8)
-              except TimeoutExpired:
-                  app.terminate()
-                  try:
-                      app.wait(timeout=15)
-                  except TimeoutExpired:
-                      app.kill()
-                      app.wait()
-              else:
-                  raise SystemExit(f"App closed during startup: {status}")
+                  with Popen([binary], env={**environ, "QT_QPA_PLATFORM": platform},
+                             stdout=PIPE, stderr=STDOUT, text=True, errors="replace") as app:
+                      try:
+                          output, _ = app.communicate(timeout=8)
+                      except TimeoutExpired:
+                          app.terminate()
+                          try:
+                              app.communicate(timeout=15)
+                          except TimeoutExpired:
+                              app.kill()
+                              app.communicate()
+                          print(f"App stayed open using {platform}.")
+                          break
+                      diagnostics.append(f"{platform}: exit {app.returncode}. {output[-1100:]}")
+              except OSError as exc:
+                  diagnostics.append(f"{platform}: {exc}")
+          else:
+              signature = run(["/usr/bin/codesign", "--verify", "--deep", "--strict", binary],
+                              capture_output=True, text=True).stderr
+              message = " ".join((*diagnostics, signature)).replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+              print(f"::error title=FinanceArchive startup::{message}")
+              raise SystemExit(1)
           PY
+      - name: Run archive tests
+        run: |
+          set -o pipefail
+          prototype/.venv/bin/python -m unittest discover -s prototype -v 2>&1 | tee "${RUNNER_TEMP}/finance-tests.log"
       - name: Upload the local test installer
         uses: actions/upload-artifact@v4
         with:
