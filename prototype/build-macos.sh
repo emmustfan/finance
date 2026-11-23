@@ -33,7 +33,12 @@ fi
 
 stage=$(mktemp -d)
 trap 'rm -rf "$stage"' EXIT
-ditto dist/FinanceArchive.app "$stage/FinanceArchive.app"
-pkgbuild --root "$stage" --install-location /Applications \
+payload="$stage/payload"
+mkdir "$payload"
+ditto dist/FinanceArchive.app "$payload/FinanceArchive.app"
+pkgbuild --analyze --root "$payload" "$stage/components.plist"
+# Keep Installer from updating the build copy or another copy of the app on the Mac.
+/usr/libexec/PlistBuddy -c 'Set :0:BundleIsRelocatable false' "$stage/components.plist"
+pkgbuild --root "$payload" --component-plist "$stage/components.plist" --install-location /Applications \
     --identifier org.familyfinance.archive --version 1.3.0 \
     dist/FinanceArchive.pkg
