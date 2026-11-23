@@ -8,10 +8,11 @@ from datetime import date
 from pathlib import Path
 
 from assets import Asset
-from documents import Catalog
-from finance import activity, export_text, flow_breakdown, flow_totals
+from debts import Debt
+from documents import Catalog, document_deadline
+from finance import activity, apply_statement, export_text, flow_breakdown, flow_totals
 from funds import Fund, Funds, goal_gap
-from ledger import Entry
+from ledger import Entry, preview_import, read_statement
 from review import Recurring, Rule
 from vault import copy_verified
 
@@ -89,6 +90,86 @@ class FinanceTest(unittest.TestCase):
         exported = export_text(rows, "2026-11-01", "2026-11-30", kind="csv", details=True)
         details = list(csv.DictReader(io.StringIO(exported)))
         self.assertEqual(details[-1]["description"], "'=HYPERLINK()")
+
+    def test_import_saves_articles_and_tags_only_for_accepted_operations(self):
+        catalog = Catalog.create(self.path, self.password, assets=(Asset("Карта", "account", "Я"),))
+        catalog = catalog.record_manual(Entry(1, "2026-11-20", 1500_00, "Поступление"), "Подработка")
+        catalog = catalog.record_manual(Entry(1, "2026-11-22", -20_00, "Обед"), "Кафе", tags=("Дом",))
+        path = self.path.with_name("fictional.csv")
+        path.write_text("Дата;Сумма;Описание;ID операции\n"
+                        "22.11.2026;-20,00;Обед;\n"
+                        "23.11.2026;-100,00;Билет на экскурсию;test-1\n"
+                        "24.11.2026;-50,00;Ресторан;test-2\n"
+                        "25.11.2026;20,00;Возврат;test-3\n", encoding="utf-8")
+        statement = read_statement(path)
+        mapping = statement.suggested_columns()
+        preview = preview_import(catalog.ledger, 1, statement, mapping)
+        self.assertEqual([row.state for row in preview.rows], ["review", "new", "new", "new"])
+        directory, review = catalog.directory.edit(catalog.ledger, catalog.review, -1, "Музеи")
+        ledger, review = apply_statement(
+            catalog.ledger, review, preview, set(),
+            {2: "Кафе", 3: "Музеи", 4: "Кафе", 5: "Прочие доходы"},
+            {2: ("Отпуск",), 3: ("Отпуск", "Поездка"), 4: (" отпуск ",), 5: ("Отпуск",)},
+        )
+        staged = replace(catalog, ledger=ledger, review=review, directory=directory)
+        self.assertEqual(len(Catalog.open(self.path, self.password).ledger.entries), 2)
+        saved = catalog.save_import(staged)
+        restored = Catalog.open(self.path, self.password)
+        self.assertEqual(restored.review, saved.review)
+        self.assertEqual(restored.review.available_tags(), ("Дом", "Отпуск", "Поездка"))
+        self.assertEqual(restored.review.tags_by_operation()[2], ("Дом",))
+        self.assertEqual(restored.directory.lookup(-1, "Музеи").name, "Музеи")
+        rows = activity(restored.ledger, restored.review, "2026-11-01", "2026-11-30", "RUB", tag="ОТПУСК")
+        self.assertEqual(flow_totals(rows), (20_00, 150_00))
+        self.assertEqual(flow_breakdown(rows)[("RUB", "expense", "Музеи")], 100_00)
+        self.assertEqual(flow_breakdown(rows)[("RUB", "expense", "Кафе")], 50_00)
+        self.assertNotIn("Отпуск", export_text(rows, "2026-11-01", "2026-11-30", kind="json"))
+        exported = export_text(rows, "2026-11-01", "2026-11-30", kind="csv", include_tags=True)
+        self.assertEqual(list(csv.DictReader(io.StringIO(exported)))[0]["tags"], "Отпуск, Поездка")
+        replay = preview_import(restored.ledger, 1, statement, mapping)
+        self.assertEqual(apply_statement(restored.ledger, restored.review, replay, {2}, {}, {}),
+                         (restored.ledger, restored.review))
+        with self.assertRaisesRegex(ValueError, "Архив изменился"):
+            catalog.save_import(staged)
+
+    def test_debt_principal_preserves_wallet_balances_and_interest_enters_reports(self):
+        catalog = Catalog.create(self.path, self.password, assets=(Asset("Карта", "account", "Я"),))
+        catalog = catalog.record_debt(Debt("Анна", "borrowed", "RUB", "2026-11-10", 1000_00, "2026-12-01"),
+                                      account=1)
+        catalog = catalog.record_manual(Entry(1, "2026-11-11", -350_00, "Возврат"), "Прочие расходы")
+        with self.assertRaisesRegex(ValueError, "основной долг|Основная сумма"):
+            catalog.repay_debt(1, 400_00, operation_number=2)
+        catalog = catalog.repay_debt(1, 300_00, operation_number=2)
+        catalog = catalog.record_manual(Entry(1, "2026-11-12", -200_00, "Выдача займа"), "Прочие расходы")
+        catalog = catalog.record_debt(Debt("Друг", "lent", "RUB", "2026-11-12", 200_00, issue=3))
+        catalog = catalog.repay_debt(2, 200_00, entry=Entry(1, "2026-11-13", +225_00, "Возврат с процентами"))
+        reopened = Catalog.open(self.path, self.password)
+        self.assertEqual(reopened.review.debts.balances(), {1: 700_00, 2: 0})
+        self.assertEqual(reopened.ledger.latest_balance(1)[0], 675_00)
+        self.assertEqual(len(reopened.ledger.entries), 4)
+        rows = activity(reopened.ledger, reopened.review, "2026-11-01", "2026-11-30")
+        self.assertEqual(flow_totals(rows), (25_00, 50_00))
+        self.assertEqual(reopened.review.report(reopened.ledger, "2026-11-01", "2026-11-30"), {
+            ("RUB", "Расходы", "Проценты по займам"): 50_00,
+            ("RUB", "Доходы", "Проценты по выданным займам"): 25_00,
+        })
+        self.assertEqual(reopened.review.transfer_candidates(reopened.ledger, 1), ())
+        with self.assertRaises(ValueError):
+            reopened.repay_debt(1, 300_00, operation_number=2)
+        with self.assertRaises(ValueError):
+            reopened.record_manual(Entry(1, "2026-11-10", 40_00, "Ошибка"), number=1)
+        catalog = reopened.repay_debt(2, 0, entry=Entry(1, "2026-11-14", 5_00, "Только проценты"))
+        self.assertEqual(catalog.review.debts.balances(), {1: 700_00, 2: 0})
+
+    def test_existing_debt_snapshot_has_no_movement_and_dates_are_readable(self):
+        catalog = Catalog.create(self.path, self.password)
+        catalog = catalog.record_debt(Debt("Старый долг", "lent", "USD", "2026-10-01", 500_00))
+        self.assertEqual(catalog.review.debts.balances()[1], 500_00)
+        self.assertFalse(catalog.ledger.entries)
+        self.assertFalse(catalog.liquid_totals())
+        self.assertEqual(document_deadline("01.12.2026"), date(2026, 12, 1))
+        self.assertEqual(document_deadline("2026-12-01"), date(2026, 12, 1))
+        self.assertIsNone(document_deadline("31.11.2026"))
 
     def test_goal_planning_and_investments_survive_reopen(self):
         fund = Fund("Образование", "Цель", "RUB", 120_000_00, 1, "2027-01-18")

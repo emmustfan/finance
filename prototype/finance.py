@@ -6,16 +6,18 @@ from collections import defaultdict
 from dataclasses import asdict, dataclass, replace
 from io import StringIO
 
-from ledger import Ledger, _normalized
-from review import Review, period
+from debts import interest_category
+from ledger import Ledger, Preview, _normalized
+from review import Assignment, Review, period
 
 DEFAULT_INCOME = ("Зарплата", "Подработка", "Подарки", "Проценты по вкладам", "Дивиденды", "Прочие доходы")
 DEFAULT_EXPENSE = (
     "Продукты", "Кафе", "Транспорт", "Жильё → Аренда", "Коммунальные услуги", "Здоровье",
-    "Образование", "Подписки", "Одежда", "Путешествия", "Комиссии банка", "Налоги и взносы ИП",
+    "Образование", "Подписки", "Одежда", "Путешествия", "Экскурсии и развлечения",
+    "Комиссии банка", "Налоги и взносы ИП",
     "Прочие расходы",
 )
-FLOW_LABELS = {"income": "Доход", "expense": "Расход", "transfer": "Перевод"}
+FLOW_LABELS = {"income": "Доход", "expense": "Расход", "transfer": "Перевод", "debt": "Долг"}
 UNCATEGORIZED = "Без статьи"
 
 
@@ -113,10 +115,29 @@ class Directory:
         proposal = review.suggestion(entry)
         if proposal is None:
             return None
-        category = self.lookup(1 if entry.amount > 0 else -1, proposal.category)
+        name = " ".join(proposal.category.split())
+        if not 1 <= len(name) <= 100:
+            return None
+        category = self.lookup(1 if entry.amount > 0 else -1, name)
         if category is None:
-            return proposal
+            return replace(proposal, category=name)
         return None if category.archived else replace(proposal, category=category.name)
+
+
+def apply_statement(
+    ledger: Ledger, review: Review, preview: Preview, confirmed: set[int],
+    articles: dict[int, str], tags: dict[int, tuple[str, ...]],
+) -> tuple[Ledger, Review]:
+    posted = preview.apply(ledger, confirmed)
+    if len(posted.entries) == len(ledger.entries):
+        return posted, review
+    numbers = {row.line: number for number, row in
+               enumerate(preview.accepted_rows(confirmed), start=len(ledger.entries) + 1)}
+    assigned = tuple(Assignment(number, articles[line]) for line, number in numbers.items() if articles.get(line))
+    if assigned:
+        review = review.assign(assigned)
+    tagged = {number: tags[line] for line, number in numbers.items() if tags.get(line)}
+    return posted, review.tag_operations(tagged) if tagged else review
 
 
 @dataclass(frozen=True)
@@ -132,32 +153,45 @@ class Activity:
     recipient: str
     fee: int = 0
     pair: int | None = None
+    tags: tuple[str, ...] = ()
+    principal: int = 0
 
     @property
     def income(self) -> int:
-        return self.amount if self.kind == "income" else 0
+        return max(0, self.amount - self.principal) if self.kind != "transfer" else 0
 
     @property
     def expense(self) -> int:
-        return -self.amount if self.kind == "expense" else self.fee
+        return max(0, -self.amount - self.principal) if self.kind != "transfer" else self.fee
 
 
-def activity(ledger: Ledger, review: Review, start: str, end: str, currency="") -> tuple[Activity, ...]:
+def activity(ledger: Ledger, review: Review, start: str, end: str, currency="", *, tag="") -> tuple[Activity, ...]:
     period(start, end)
     currencies = {item.account: item.currency for item in ledger.openings}
     assigned = review.assignments_by_operation()
     linked = {number: pair for pair in review.transfers for number in (pair.debit, pair.credit)}
+    debt_moves = review.debts.movements()
+    tags = review.tags_by_operation()
+    tag_key = _normalized(tag)
     rows = []
     for number, entry in enumerate(ledger.entries, 1):
         code = currencies[entry.account]
-        if not start <= entry.day <= end or (currency and code != currency):
+        row_tags = tags.get(number, ())
+        if (not start <= entry.day <= end or (currency and code != currency)
+                or (tag_key and not any(_normalized(name) == tag_key for name in row_tags))):
             continue
         pair = linked.get(number)
         kind = "transfer" if pair else "income" if entry.amount > 0 else "expense"
         category = "Внутренний перевод" if pair else assigned[number].category if number in assigned else UNCATEGORIZED
+        principal = 0
+        if number in debt_moves:
+            kind = "debt"
+            principal, movement = debt_moves[number]
+            category = interest_category(entry.amount) if abs(entry.amount) > principal else movement
         rows.append(Activity(
             number, entry.day, entry.account, code, entry.amount, kind, category, entry.description,
             entry.recipient, pair.fee if pair and number == pair.debit else 0, pair.debit if pair else None,
+            row_tags, principal,
         ))
     return tuple(sorted(rows, key=lambda row: (row.day, row.number), reverse=True))
 
@@ -183,7 +217,8 @@ def spreadsheet_safe(value: str) -> str:
     return value
 
 
-def export_text(rows: tuple[Activity, ...], start: str, end: str, *, kind: str, details=False) -> str:
+def export_text(rows: tuple[Activity, ...], start: str, end: str, *, kind: str, details=False,
+                include_tags=False) -> str:
     if kind not in ("json", "csv"):
         raise ValueError("Выберите формат JSON или CSV.")
     wallets = {number: f"Счёт {i}" for i, number in enumerate(sorted({row.account for row in rows}), 1)}
@@ -198,7 +233,10 @@ def export_text(rows: tuple[Activity, ...], start: str, end: str, *, kind: str, 
             "date": row.day, "wallet": wallets[row.account], "currency": row.currency, "type": row.kind,
             "category": row.category, "amount_minor": row.amount, "income_minor": row.income,
             "expense_minor": row.expense, "transfer_fee_minor": row.fee, "transfer_pair": pairs.get(row.pair),
+            "debt_principal_minor": row.principal if row.kind == "debt" else None,
         }
+        if include_tags:
+            record["tags"] = list(row.tags) if kind == "json" else ", ".join(row.tags)
         if details:
             record.update(description=row.description, recipient=row.recipient)
         operations.append(record)
@@ -218,7 +256,8 @@ def export_text(rows: tuple[Activity, ...], start: str, end: str, *, kind: str, 
         }
         return json.dumps(payload, ensure_ascii=False, indent=2) + "\n"
     fields = ("date", "wallet", "currency", "type", "category", "amount_minor", "income_minor",
-              "expense_minor", "transfer_fee_minor", "transfer_pair")
+              "expense_minor", "transfer_fee_minor", "transfer_pair", "debt_principal_minor")
+    fields += ("tags",) if include_tags else ()
     fields += ("description", "recipient") if details else ()
     stream = StringIO(newline="")
     writer = csv.DictWriter(stream, fields)

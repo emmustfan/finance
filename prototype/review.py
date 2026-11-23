@@ -6,6 +6,7 @@ from dataclasses import asdict, dataclass, replace
 from datetime import date
 
 from assets import Asset
+from debts import Debts, interest_category
 from ledger import Entry, Ledger, _day, _normalized
 
 TRANSFER_WORDS = ("перевод", "transfer", "пополнение вклада", "между счетами", "сбп")
@@ -53,6 +54,12 @@ class Suggestion:
     difference: int | None = None
 
 
+@dataclass(frozen=True)
+class OperationTags:
+    operation: int
+    names: tuple[str, ...]
+
+
 def is_business(asset: Asset, scope: str) -> bool:
     return asset.category == "account" and (
         scope == "business" or _normalized(asset.kind) == "счёт ип" or _normalized(asset.kind) == "счет ип"
@@ -77,9 +84,16 @@ class Review:
     assignments: tuple[Assignment, ...] = ()
     rules: tuple[Rule, ...] = ()
     recurring: tuple[Recurring, ...] = ()
+    tags: tuple[OperationTags, ...] = ()
+    debts: Debts = Debts()
 
     def to_payload(self) -> dict:
-        return asdict(self)
+        payload = asdict(self)
+        if not self.tags:
+            del payload["tags"]
+        if self.debts == Debts():
+            del payload["debts"]
+        return payload
 
     @classmethod
     def from_payload(cls, payload: dict) -> "Review":
@@ -89,6 +103,8 @@ class Review:
             assignments=tuple(Assignment(**item) for item in payload["assignments"]),
             rules=tuple(Rule(**item) for item in payload["rules"]),
             recurring=tuple(Recurring(**item) for item in payload["recurring"]),
+            tags=tuple(OperationTags(item["operation"], tuple(item["names"])) for item in payload.get("tags", ())),
+            debts=Debts.from_payload(payload["debts"]) if "debts" in payload else Debts(),
         )
 
     @property
@@ -98,6 +114,38 @@ class Review:
     def assignments_by_operation(self) -> dict[int, Assignment]:
         return {item.operation: item for item in self.assignments}
 
+    @property
+    def fixed_operations(self) -> set[int]:
+        return self.linked | self.debts.movements().keys()
+
+    def tags_by_operation(self) -> dict[int, tuple[str, ...]]:
+        return {item.operation: item.names for item in self.tags}
+
+    def available_tags(self) -> tuple[str, ...]:
+        names = {}
+        for item in self.tags:
+            for name in item.names:
+                names.setdefault(_normalized(name), name)
+        return tuple(names[key] for key in sorted(names))
+
+    def tag_operations(self, values: dict[int, tuple[str, ...]], *, extend=False) -> "Review":
+        available = {_normalized(name): name for name in self.available_tags()}
+        updates = self.tags_by_operation()
+        for number, names in values.items():
+            tags = dict.fromkeys(updates.get(number, ()) if extend else ())
+            for value in names:
+                name = " ".join(value.split())
+                if not name:
+                    continue
+                if len(name) > 80 or "," in name:
+                    raise ValueError("Введите тег до 80 символов. Запятая разделяет теги.")
+                tags[available.setdefault(_normalized(name), name)] = None
+            if tags:
+                updates[number] = tuple(tags)
+            else:
+                updates.pop(number, None)
+        return replace(self, tags=tuple(OperationTags(number, names) for number, names in sorted(updates.items())))
+
     def validate(self, ledger: Ledger, assets: tuple[Asset, ...], scope: str) -> None:
         opening_by_account = {opening.account: opening for opening in ledger.openings}
         asset_by_account = {asset.asset_number: asset for asset in assets}
@@ -106,7 +154,11 @@ class Review:
         for pair in self.transfers:
             if type(pair.fee) is not int or self.transfer_fee(ledger, pair.debit, pair.credit) != pair.fee:
                 raise ValueError("Некорректная комиссия перевода.")
-        seen = self.linked
+        self.debts.validate(ledger)
+        if self.linked & self.debts.movements().keys():
+            raise ValueError("Операция по долгу уже связана с внутренним переводом.")
+        fixed = self.fixed_operations
+        seen = set(fixed)
         for item in self.assignments:
             entry = operation(ledger, item.operation)
             if item.operation in seen or not isinstance(item.category, str) or not item.category.strip():
@@ -121,8 +173,22 @@ class Review:
             raise ValueError("Операция уже ожидает пару.")
         for number in self.waiting:
             operation(ledger, number)
-            if number in self.linked:
-                raise ValueError("Перевод уже связан.")
+            if number in fixed:
+                raise ValueError("Движение уже связано с переводом или долгом.")
+        tagged = set()
+        for item in self.tags:
+            operation(ledger, item.operation)
+            if item.operation in tagged or not item.names:
+                raise ValueError("Повтор записи тегов операции.")
+            keys = set()
+            for name in item.names:
+                if not isinstance(name, str) or not name.strip() or len(name) > 80 or "," in name:
+                    raise ValueError("Некорректный тег операции.")
+                key = _normalized(name)
+                if key in keys:
+                    raise ValueError("Тег уже добавлен к этой операции.")
+                keys.add(key)
+            tagged.add(item.operation)
         for rule in self.rules:
             if rule.field not in RULE_FIELDS or rule.direction not in (-1, 1) or not (
                 isinstance(rule.pattern, str) and isinstance(rule.category, str)
@@ -155,7 +221,7 @@ class Review:
 
     def transfer_candidates(self, ledger: Ledger, number: int) -> tuple[tuple[int, int, str], ...]:
         entry = operation(ledger, number)
-        linked = self.linked
+        linked = self.fixed_operations
         if number in linked:
             return ()
         openings = {opening.account: opening for opening in ledger.openings}
@@ -192,7 +258,7 @@ class Review:
 
     def wait_for_transfer(self, ledger: Ledger, number: int) -> "Review":
         operation(ledger, number)
-        if number in self.linked or number in self.waiting:
+        if number in self.fixed_operations or number in self.waiting:
             return self
         assignments = tuple(item for item in self.assignments if item.operation != number)
         return replace(self, waiting=(*self.waiting, number), assignments=assignments)
@@ -204,8 +270,8 @@ class Review:
         if pair in self.transfers:
             return self
         touched = {outgoing, incoming}
-        if touched & self.linked:
-            raise ValueError("Одна из операций уже входит в другой перевод.")
+        if touched & self.fixed_operations:
+            raise ValueError("Одна из операций уже связана с переводом или долгом.")
         return replace(
             self, transfers=(*self.transfers, pair), waiting=tuple(num for num in self.waiting if num not in touched),
             assignments=tuple(item for item in self.assignments if item.operation not in touched),
@@ -218,14 +284,30 @@ class Review:
         )
 
     def assign(self, items: tuple[Assignment, ...]) -> "Review":
-        if any(item.operation in self.linked for item in items):
-            raise ValueError("Связанные переводы не относятся к доходам и расходам.")
+        fixed = self.fixed_operations
+        if any(item.operation in fixed for item in items):
+            raise ValueError("Движения, связанные с переводом или долгом, имеют свою статью.")
         assignments = self.assignments_by_operation()
         for item in items:
             assignments[item.operation] = item
         confirmed = set(assignments)
         return replace(self, assignments=tuple(assignments.values()),
                        waiting=tuple(number for number in self.waiting if number not in confirmed))
+
+    def classify(self, numbers: tuple[int, ...], category: str) -> "Review":
+        if not category:
+            targets = set(numbers)
+            return replace(self, assignments=tuple(item for item in self.assignments if item.operation not in targets))
+        assigned = self.assignments_by_operation()
+        return self.assign(tuple(Assignment(number, category, number in assigned and assigned[number].taxable)
+                                 for number in numbers))
+
+    def with_debts(self, debts: Debts, *, attached: int | None = None) -> "Review":
+        if attached in self.linked:
+            raise ValueError("Сначала снимите связь с внутренним переводом.")
+        return replace(self, debts=debts,
+                       assignments=tuple(item for item in self.assignments if item.operation != attached),
+                       waiting=tuple(item for item in self.waiting if item != attached))
 
     def learn(self, rule: Rule) -> "Review":
         rules = tuple(item for item in self.rules if (item.field, _normalized(item.pattern), item.direction)
@@ -253,7 +335,8 @@ class Review:
                 (("аренда", "аренду"), "Жильё → Аренда"),
                 (("комиссия", "commission"), "Комиссии банка"),
                 (("продукты", "супермаркет"), "Продукты"),
-                (("кофе", "coffee", "кафе"), "Кафе"),
+                (("кофе", "coffee", "кафе", "ресторан"), "Кафе"),
+                (("такси", "метро"), "Транспорт"),
                 (("налог", "фнс", "страховые взносы"), TAX_PAYMENT),
             )
             for patterns, category in builtins:
@@ -270,7 +353,7 @@ class Review:
     def calendar(self, ledger: Ledger, month: str) -> tuple[tuple[str, Recurring, Entry | None], ...]:
         first = date.fromisoformat(month + "-01")
         last = monthrange(first.year, first.month)[1]
-        used = self.linked
+        used = self.fixed_operations
         rows = []
         plans = sorted(
             ((first.replace(day=min(item.month_day, last)).isoformat(), item) for item in self.recurring),
@@ -298,6 +381,7 @@ class Review:
         currencies = {item.account: item.currency for item in ledger.openings}
         assigned = self.assignments_by_operation()
         linked = self.linked
+        debt_moves = self.debts.movements()
         fees = {pair.debit: pair.fee for pair in self.transfers if pair.fee}
         for number, entry in enumerate(ledger.entries, 1):
             if not start <= entry.day <= end:
@@ -306,6 +390,12 @@ class Review:
             if number in linked:
                 if number in fees:
                     totals[currency, "Расходы", "Комиссии банка"] += fees[number]
+                continue
+            if number in debt_moves:
+                interest = abs(entry.amount) - debt_moves[number][0]
+                if interest:
+                    totals[currency, "Доходы" if entry.amount > 0 else "Расходы",
+                           interest_category(entry.amount)] += interest
                 continue
             category = assigned[number].category if number in assigned else "Без подтверждённой статьи"
             totals[currency, "Доходы" if entry.amount > 0 else "Расходы", category] += abs(entry.amount)

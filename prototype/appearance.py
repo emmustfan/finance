@@ -5,7 +5,7 @@ from zlib import crc32
 from PySide6.QtCore import QPoint, QRect, QSize, Qt, Signal
 from PySide6.QtGui import QFont, QFontDatabase
 from PySide6.QtWidgets import (
-    QApplication, QComboBox, QFrame, QLabel, QLayout, QLineEdit, QPushButton, QScrollArea, QToolButton,
+    QApplication, QComboBox, QCompleter, QFrame, QLabel, QLayout, QLineEdit, QPushButton, QScrollArea, QToolButton,
     QVBoxLayout, QWidget,
 )
 
@@ -45,9 +45,17 @@ QFrame#financeMetric { background: #F3F7F6; border: 1px solid #DEEAE5; border-ra
 QLabel#financeValue, QLabel#financePositive, QLabel#financeExpense { font-size: 21px; font-weight: 700; }
 QLabel#financePositive { color: #146951; }
 QLabel#financeExpense, QLabel#financeError { color: #9E3940; }
+QLabel#deadlineSoon { color: #7C5018; }
 QTabWidget#financeTabs::pane { border: 1px solid #DEE6EC; border-radius: 10px; }
-QTabWidget#financeTabs QTabBar::tab { padding: 9px 14px; margin-right: 4px; color: #465970; }
-QTabWidget#financeTabs QTabBar::tab:selected { color: #146951; border-bottom: 2px solid #146951; font-weight: 700; }
+QTabWidget#financeTabs QTabBar::tab {
+    padding: 9px 14px; margin-right: 4px; color: #465970; background: #F4F7FA;
+    border: 1px solid #E3EAF1; border-bottom-color: transparent;
+    border-top-left-radius: 8px; border-top-right-radius: 8px;
+}
+QTabWidget#financeTabs QTabBar::tab:hover { background: #EFF6F4; color: #146951; }
+QTabWidget#financeTabs QTabBar::tab:selected {
+    color: #146951; background: #E6F3EE; border-bottom: 2px solid #146951; font-weight: 700;
+}
 QProgressBar { background: #EAF2EF; border: 0; border-radius: 7px; text-align: center; color: #162D27; }
 QProgressBar::chunk { background: #A6DCC8; border-radius: 7px; }
 QLabel#rowTitle { color: #203146; font-weight: 700; }
@@ -56,6 +64,7 @@ QPushButton, QToolButton {
     border-radius: 9px; padding: 7px 11px; font-weight: 600;
 }
 QPushButton:hover, QToolButton:hover { background: #F1F5FA; border-color: #BFCFE0; }
+QPushButton:checked { background: #E7F4EF; border-color: #A6DCC8; }
 QPushButton:focus, QToolButton:focus { border: 1px solid #14755E; }
 QPushButton:disabled, QToolButton:disabled { color: #65768A; background: #F1F3F6; border-color: #E1E6ED; }
 QPushButton[primary="true"] { color: white; background: #146951; border-color: #146951; }
@@ -71,6 +80,7 @@ QPushButton[sidebar="true"]:focus, QToolButton[sidebar="true"]:focus { border-co
 QPushButton[sidebar="true"]:checked { color: #B6F2DD; background: #274A49; }
 QPushButton[sidebar="true"]:disabled, QToolButton[sidebar="true"]:disabled { color: #9AA9BD; }
 QPushButton#smallButton { padding: 5px 9px; }
+QPushButton#categoryField { text-align: left; }
 QToolButton#typeToggle { border: 1px solid transparent; padding: 0; background: transparent; }
 QToolButton#typeToggle:hover, QToolButton#typeToggle:focus { border-color: #BFCFE0; background: #E7F4EF; }
 QLineEdit, QComboBox {
@@ -83,6 +93,11 @@ QLineEdit:disabled { color: #65768A; background: #F1F3F6; }
 QComboBox { padding-right: 24px; }
 QComboBox::drop-down { width: 23px; border: 0; padding-right: 7px; }
 QComboBox::down-arrow { width: 9px; height: 9px; }
+QDateEdit {
+    color: #1A2737; background: #F8FAFC; border: 1px solid #D7E0EA;
+    border-radius: 8px; padding: 7px 7px;
+}
+QDateEdit:focus { border-color: #388E76; background: #FFFFFF; }
 QListWidget { background: transparent; border: 0; outline: 0; padding: 1px; }
 QListWidget::item { border: 1px solid transparent; border-radius: 11px; }
 QListWidget::item:hover { background: #F1F5FA; }
@@ -152,8 +167,12 @@ def area(widget) -> QScrollArea:
     return view
 
 
+def tag_colors(name: str) -> tuple[str, str, str]:
+    return PALETTES[crc32(name.casefold().encode()) % len(PALETTES)]
+
+
 def tag_button(name: str, *, remove: bool = False) -> QPushButton:
-    background, ink, border = PALETTES[crc32(name.casefold().encode()) % len(PALETTES)]
+    background, ink, border = tag_colors(name)
     caption = name.replace("&", "&&")
     button = QPushButton(f"{caption}  ×" if remove else caption)
     button.setAutoDefault(False)
@@ -195,6 +214,7 @@ class TagFlow(QLayout):
 
     def addItem(self, item):
         self.items.append(item)
+        self.invalidate()
 
     def count(self):
         return len(self.items)
@@ -203,7 +223,11 @@ class TagFlow(QLayout):
         return self.items[index] if 0 <= index < len(self.items) else None
 
     def takeAt(self, index):
-        return self.items.pop(index) if 0 <= index < len(self.items) else None
+        if 0 <= index < len(self.items):
+            item = self.items.pop(index)
+            self.invalidate()
+            return item
+        return None
 
     def hasHeightForWidth(self):
         return True
@@ -236,7 +260,7 @@ class TagFlow(QLayout):
 
 
 class TagEditor(QWidget):
-    def __init__(self, existing: str = "", parent=None):
+    def __init__(self, existing: str = "", parent=None, *, suggestions: tuple[str, ...] = ()):
         super().__init__(parent)
         self.names = list(tag_names(existing))
         stack = QVBoxLayout(self)
@@ -247,6 +271,11 @@ class TagEditor(QWidget):
         self.input = QLineEdit()
         self.input.setPlaceholderText("Введите тег и нажмите Enter")
         self.input.setAccessibleName("Добавить тег")
+        if suggestions:
+            completion = QCompleter(suggestions, self.input)
+            completion.setCaseSensitivity(Qt.CaseSensitivity.CaseInsensitive)
+            completion.setFilterMode(Qt.MatchFlag.MatchContains)
+            self.input.setCompleter(completion)
         self.input.returnPressed.connect(self.commit_input)
         self.input.textEdited.connect(self.split_input)
         stack.addWidget(self.input)

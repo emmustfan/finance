@@ -9,13 +9,14 @@ import re
 import stat
 import tempfile
 from dataclasses import asdict, dataclass, field, fields, replace
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from io import BytesIO
 from pathlib import Path
 
 from PIL import Image, ImageOps
 
 from assets import Asset, validate_assets
+from debts import ISSUE_SIGN, Debt, Repayment
 from finance import Directory
 from funds import Funds
 from ledger import Entry, Ledger, Opening, _day
@@ -43,6 +44,15 @@ DEFAULT_KINDS = (
 MAX_PHOTO = 12 * 1024 * 1024
 MAX_PHOTO_PIXELS = 50_000_000
 MAX_ATTACHMENT_BYTES = MAX_DOCUMENT_DATA * 3 // 4
+
+
+def document_deadline(value: str) -> date | None:
+    for pattern in ("%Y-%m-%d", "%d.%m.%Y"):
+        try:
+            return datetime.strptime(value.strip(), pattern).date()
+        except ValueError:
+            continue
+    return None
 
 
 @dataclass(frozen=True)
@@ -130,8 +140,8 @@ class Card:
         if tag and not any(name.casefold() == tag for name in tag_names(self.tags)):
             return False
         searchable = " ".join(
-            (self.title, self.number, self.party, self.kind, self.tags, self.folder,
-             self.archive_label)
+            (self.title, self.number, self.party, self.kind, self.tags, self.date, self.expires, self.note,
+             self.address, self.archive_label)
         ).casefold()
         return all(term in searchable for term in query.casefold().split())
 
@@ -191,6 +201,8 @@ def _encode_catalog(
             content["ledger"] = ledger.to_payload()
         if review != Review():
             content["review"] = review.to_payload()
+        if review.tags or review.debts.items:
+            content["format_revision"] = 2
         if funds != Funds():
             content["funds"] = funds.to_payload()
         if directory != Directory():
@@ -211,9 +223,11 @@ def decode_catalog(
         assets = []
         ledger = Ledger()
         review, funds, directory, scope = Review(), Funds(), Directory(), "legacy"
-        optional_sections = {"ledger", "review", "funds", "directory", "scope"}
+        optional_sections = {"ledger", "review", "funds", "directory", "scope", "format_revision"}
         if isinstance(content, dict) and set(content) - optional_sections == {"cards", "assets"}:
             items = content["cards"]
+            if "format_revision" in content and content["format_revision"] != 2:
+                raise ValueError("Для этого формата требуется более новая версия приложения.")
             if "ledger" in content:
                 ledger = Ledger.from_payload(content["ledger"])
             if "review" in content:
@@ -371,8 +385,12 @@ class Catalog:
         return self._save(cards, self.assets)
 
     def add_asset(self, asset: Asset) -> "Catalog":
+        staged = self.stage_asset(asset)
+        return self._save(self.cards, staged.assets)
+
+    def stage_asset(self, asset: Asset) -> "Catalog":
         number = max((existing.asset_number for existing in self.assets), default=0) + 1
-        return self._save(self.cards, (*self.assets, replace(asset, asset_number=number)))
+        return replace(self, assets=(*self.assets, replace(asset, asset_number=number)))
 
     def update_asset(self, index: int, asset: Asset) -> "Catalog":
         if not 0 <= index < len(self.assets):
@@ -393,6 +411,11 @@ class Catalog:
 
     def save_directory(self, directory: Directory, review: Review) -> "Catalog":
         return self._save(self.cards, self.assets, review=review, directory=directory)
+
+    def save_import(self, staged: "Catalog") -> "Catalog":
+        if staged.path != self.path or staged.revision != self.revision:
+            raise ValueError("Архив изменился. Откройте его заново и повторите импорт.")
+        return self._save(self.cards, staged.assets, staged.ledger, review=staged.review, directory=staged.directory)
 
     def _manual_opening(self, ledger: Ledger, account: int, day: str, prior: int | None) -> Ledger:
         asset = next((asset for asset in self.assets if asset.asset_number == account
@@ -421,7 +444,8 @@ class Catalog:
 
     def record_manual(self, entry: Entry, category: str = "", *, prior: int | None = None,
                       number: int | None = None, taxable: bool = False,
-                      fund: int | None = None) -> "Catalog":
+                      fund: int | None = None, tags: tuple[str, ...] | None = None,
+                      directory: Directory | None = None) -> "Catalog":
         if entry.source != "manual":
             raise ValueError("Ручной ввод принимает только ручные операции.")
         ledger, review = self.ledger, self.review
@@ -431,7 +455,7 @@ class Catalog:
             if not 1 <= number <= len(ledger.entries):
                 raise ValueError("Операция не найдена.")
             old = ledger.entries[number - 1]
-            if old.source != "manual" or number in review.linked or any(
+            if old.source != "manual" or number in review.fixed_operations or any(
                 move.operation == number for move in self.funds.movements
             ):
                 raise ValueError("Для этой операции доступны статьи в разделе разбора. Денежные движения связаны с другими записями.")
@@ -445,7 +469,9 @@ class Catalog:
         if category:
             if len(category) > 100:
                 raise ValueError("Название статьи должно содержать не более 100 символов.")
-            found = self.directory.lookup(1 if entry.amount > 0 else -1, category)
+            found = (self.directory if directory is None else directory).lookup(
+                1 if entry.amount > 0 else -1, category
+            )
             if found is not None:
                 previous = review.assignments_by_operation().get(number)
                 if found.archived and (previous is None or previous.category != found.name):
@@ -460,15 +486,45 @@ class Catalog:
             if entry.amount >= 0:
                 raise ValueError("Из фонда можно списать только расход.")
             funds = funds.apply(f"expense:{number}", ((fund, entry.amount),), number)
-        return self._save(self.cards, self.assets, ledger, review=review, funds=funds)
+        if tags is not None:
+            review = review.tag_operations({number: tags})
+        return self._save(self.cards, self.assets, ledger, review=review, funds=funds, directory=directory)
 
     def record_transfer(self, debit: Entry, credit: Entry, *, debit_prior: int | None = None,
-                        credit_prior: int | None = None) -> "Catalog":
+                        credit_prior: int | None = None, tags: tuple[str, ...] = ()) -> "Catalog":
         ledger = self._manual_opening(self.ledger, debit.account, debit.day, debit_prior)
         ledger = self._manual_opening(ledger, credit.account, credit.day, credit_prior)
         debit_number = len(ledger.entries) + 1
         ledger = ledger.add_manual(debit).add_manual(credit)
         review = self.review.link_transfer(ledger, debit_number, debit_number + 1)
+        if tags:
+            review = review.tag_operations({debit_number: tags, debit_number + 1: tags})
+        return self._save(self.cards, self.assets, ledger, review=review)
+
+    def record_debt(self, debt: Debt, *, account: int | None = None, prior: int | None = None) -> "Catalog":
+        ledger = self.ledger
+        if account is not None:
+            if debt.issue is not None or debt.direction not in ISSUE_SIGN:
+                raise ValueError("Выберите один способ записи выдачи займа.")
+            ledger = self._manual_opening(ledger, account, debt.day, prior)
+            amount = debt.amount * ISSUE_SIGN[debt.direction]
+            ledger = ledger.add_manual(Entry(account, debt.day, amount, debt.title, recipient=debt.title))
+            debt = replace(debt, issue=len(ledger.entries))
+        review = self.review.with_debts(self.review.debts.add(debt), attached=debt.issue)
+        return self._save(self.cards, self.assets, ledger, review=review)
+
+    def repay_debt(self, number: int, principal: int, *, entry: Entry | None = None,
+                   operation_number: int | None = None, prior: int | None = None) -> "Catalog":
+        ledger = self.ledger
+        if entry is not None:
+            if operation_number is not None or entry.source != "manual":
+                raise ValueError("Выберите один способ записи возврата.")
+            ledger = self._manual_opening(ledger, entry.account, entry.day, prior)
+            ledger = ledger.add_manual(entry)
+            operation_number = len(ledger.entries)
+        debts = self.review.debts
+        debts = replace(debts, payments=(*debts.payments, Repayment(number, operation_number, principal)))
+        review = self.review.with_debts(debts, attached=operation_number)
         return self._save(self.cards, self.assets, ledger, review=review)
 
     def save_funds(self, funds: Funds) -> "Catalog":

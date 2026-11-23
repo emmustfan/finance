@@ -2,25 +2,28 @@
 
 import os
 import tempfile
-from datetime import date
+from datetime import date, timedelta
 from pathlib import Path
 from uuid import uuid4
 
 from PySide6.QtCore import QDate, QRectF, Qt
-from PySide6.QtGui import QColor, QPainter, QPen
+from PySide6.QtGui import QColor, QKeySequence, QPainter, QPen, QShortcut
 from PySide6.QtWidgets import (
-    QCheckBox, QDialog, QFileDialog, QFormLayout, QHBoxLayout, QLineEdit,
-    QMessageBox, QProgressBar, QTabWidget, QVBoxLayout, QWidget,
+    QAbstractItemView, QCheckBox, QDialog, QFileDialog, QFormLayout, QHBoxLayout, QHeaderView, QLineEdit,
+    QMenu, QMessageBox, QProgressBar, QTabWidget, QVBoxLayout, QWidget,
 )
 
 from appearance import ChoiceBox, area, button, frame, label
 from asset_views import AssetEditor, RegistryDialog
 from assets import amount_text, parse_amount
-from finance import FLOW_LABELS, activity, export_text, flow_breakdown, flow_totals
+from debt_views import DebtEditor, DebtPanel
+from debts import ISSUE_SIGN
+from finance import FLOW_LABELS, UNCATEGORIZED, activity, export_text, flow_breakdown, flow_totals
 from finance_editors import DirectoryDialog, OperationEditor, WalletEditor, date_field, field_date, form_dialog
 from fund_views import FundsDialog, OverviewDialog
 from funds import Fund, goal_gap
-from ledger_views import LedgerDialog, table
+from ledger_views import LedgerDialog, import_statements, table
+from operation_controls import TAG_NAMES, TagCells, category_menu, choose_tags, selecting_rows
 from review import period
 from review_views import CategoryDialog, ReviewDialog, fill_table
 
@@ -45,23 +48,30 @@ class MonthlyChart(QWidget):
         super().__init__()
         self.points = ()
         self.limited = False
+        self.daily = False
         self.setMinimumHeight(148)
-        self.setAccessibleName("Доходы и расходы по месяцам")
+        self.setAccessibleName("График доходов и расходов")
 
     def set_period(self, rows, start, end):
+        first = QDate.fromString(start, Qt.DateFormat.ISODate)
+        last = QDate.fromString(end, Qt.DateFormat.ISODate)
+        self.daily = first.daysTo(last) < 14
         totals = {}
         for row in rows:
-            info = totals.setdefault(row.day[:7], [0, 0])
+            info = totals.setdefault(row.day if self.daily else row.day[:7], [0, 0])
             info[0] += row.income
             info[1] += row.expense
-        cursor = QDate.fromString(end[:7] + "-01", Qt.DateFormat.ISODate)
-        months = []
-        while cursor.toString(Qt.DateFormat.ISODate)[:7] >= start[:7] and len(months) < 12:
-            key = cursor.toString(Qt.DateFormat.ISODate)[:7]
-            months.append((key, *totals.get(key, (0, 0))))
-            cursor = cursor.addMonths(-1)
-        self.points = tuple(reversed(months))
-        self.limited = cursor.toString(Qt.DateFormat.ISODate)[:7] >= start[:7]
+        cursor = last if self.daily else QDate(last.year(), last.month(), 1)
+        length = 10 if self.daily else 7
+        points = []
+        while cursor.isValid() and cursor.toString(Qt.DateFormat.ISODate)[:length] >= start[:length]:
+            key = cursor.toString(Qt.DateFormat.ISODate)[:length]
+            points.append((key, *totals.get(key, (0, 0))))
+            cursor = cursor.addDays(-1) if self.daily else cursor.addMonths(-1)
+            if not self.daily and len(points) == 12:
+                break
+        self.points = tuple(reversed(points))
+        self.limited = not self.daily and cursor.isValid() and cursor.toString(Qt.DateFormat.ISODate)[:7] >= start[:7]
         self.setToolTip("\n".join(
             f"{key}: доходы {amount_text(income)}, расходы {amount_text(expense)}"
             for key, income, expense in self.points
@@ -74,14 +84,15 @@ class MonthlyChart(QWidget):
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         try:
             painter.setPen(QColor("#263A4C"))
-            painter.drawText(10, 19, "Последние 12 месяцев периода" if self.limited else "По месяцам")
+            title = "По дням" if self.daily else "Последние 12 месяцев периода" if self.limited else "По месяцам"
+            painter.drawText(10, 19, title)
             for column, (color, title) in enumerate((("#299779", "Доходы"), ("#CF6C75", "Расходы"))):
                 x = self.width() - 177 + column * 88
                 painter.fillRect(x, 10, 9, 9, QColor(color))
                 painter.drawText(x + 14, 19, title)
             if not self.points or not any(income or expense for _, income, expense in self.points):
                 painter.setPen(QColor("#53657D"))
-                painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, "За этот период операций пока нет")
+                painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, "За этот период нет доходов и расходов")
                 return
             left, top = 12, 28
             width, height = self.width() - 24, self.height() - 52
@@ -105,7 +116,8 @@ class MonthlyChart(QWidget):
                 painter.setPen(QColor("#53657D"))
                 if len(self.points) < 9 or index % 2 == 0:
                     text_box = QRectF(center - slot / 2, top + height + 4, slot, 18)
-                    painter.drawText(text_box, Qt.AlignmentFlag.AlignHCenter, f"{month[5:]}.{month[2:4]}")
+                    text = f"{month[8:10]}.{month[5:7]}" if self.daily else f"{month[5:]}.{month[2:4]}"
+                    painter.drawText(text_box, Qt.AlignmentFlag.AlignHCenter, text)
         finally:
             painter.end()
 
@@ -261,7 +273,7 @@ class DistributionDialog(QDialog):
 
 
 class ExportDialog(QDialog):
-    def __init__(self, parent, catalog, start, end):
+    def __init__(self, parent, catalog, start, end, *, tag=""):
         super().__init__(parent)
         self.catalog = catalog
         self.setWindowTitle("Экспорт финансов")
@@ -274,10 +286,18 @@ class ExportDialog(QDialog):
         self.format = ChoiceBox()
         self.format.addItem("JSON · операции и итоги для анализа", "json")
         self.format.addItem("CSV · операции для таблиц", "csv")
+        self.tag = ChoiceBox()
+        self.tag.addItem("Все теги", "")
+        for name in catalog.review.available_tags():
+            self.tag.addItem(name, name)
+        self.tag.setCurrentIndex(max(0, self.tag.findData(tag)))
+        self.include_tags = QCheckBox("Включить названия тегов в файл")
         self.details = QCheckBox("Включить описания операций и контрагентов")
         form.addRow("С", self.start)
         form.addRow("По", self.end)
         form.addRow("Формат", self.format)
+        form.addRow("Тег", self.tag)
+        form.addRow("", self.include_tags)
         form.addRow("", self.details)
         layout.addLayout(form)
         layout.addWidget(label(
@@ -286,7 +306,7 @@ class ExportDialog(QDialog):
         ))
         self.summary = label(style="sectionTitle")
         layout.addWidget(self.summary)
-        self.preview = table(("Дата", "Сумма", "Статья", "Описание"), 2)
+        self.preview = table(("Дата", "Сумма", "Статья", "Описание", "Теги"), 2)
         layout.addWidget(self.preview, 1)
         self.error = label(style="financeError", wrap=True)
         layout.addWidget(self.error)
@@ -296,14 +316,15 @@ class ExportDialog(QDialog):
         self.commit = button("Сохранить файл…", self.save, primary=True)
         actions.addWidget(self.commit)
         layout.addLayout(actions)
-        for signal in (self.start.dateChanged, self.end.dateChanged, self.details.toggled):
+        for signal in (self.start.dateChanged, self.end.dateChanged, self.details.toggled,
+                       self.tag.currentIndexChanged, self.include_tags.toggled):
             signal.connect(self.refresh)
         self.refresh()
 
     def refresh(self):
         start, end = field_date(self.start), field_date(self.end)
         try:
-            self.rows = activity(self.catalog.ledger, self.catalog.review, start, end)
+            self.rows = activity(self.catalog.ledger, self.catalog.review, start, end, tag=self.tag.currentData())
         except ValueError as exc:
             self.rows = ()
             self.error.setText(str(exc))
@@ -311,7 +332,9 @@ class ExportDialog(QDialog):
             self.error.clear()
         self.summary.setText(f"Операций в файле: {len(self.rows)} · предпросмотр первых 5")
         self.preview.setColumnHidden(3, not self.details.isChecked())
-        fill_table(self.preview, [(row.day, display(row.amount, row.currency), row.category, row.description)
+        self.preview.setColumnHidden(4, not self.include_tags.isChecked())
+        fill_table(self.preview, [(row.day, display(row.amount, row.currency), row.category, row.description,
+                                   ", ".join(row.tags))
                                   for row in self.rows[:5]])
         self.commit.setEnabled(bool(self.rows))
 
@@ -331,7 +354,8 @@ class ExportDialog(QDialog):
             if path.exists() and QMessageBox.question(self, "Заменить файл", path.name) != QMessageBox.StandardButton.Yes:
                 return
         try:
-            text = export_text(self.rows, start, end, kind=kind, details=self.details.isChecked())
+            text = export_text(self.rows, start, end, kind=kind, details=self.details.isChecked(),
+                               include_tags=self.include_tags.isChecked())
             with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8-sig" if kind == "csv" else "utf-8",
                                              newline="", dir=path.parent, delete=False) as stream:
                 temp = Path(stream.name)
@@ -348,20 +372,26 @@ class ExportDialog(QDialog):
 
 
 class FinanceDialog(QDialog):
-    def __init__(self, parent, catalog):
+    ARTICLE, TAGS = 4, 6
+
+    def __init__(self, parent, catalog, *, show_operations=False):
         super().__init__(parent)
         self.catalog = catalog
         self.document_number = None
         self.rows = ()
+        self.filtered = ()
+        self.article_filter = None
         self.goal_funds = ()
         self.setWindowTitle("Финансы")
         self.resize(1110, 740)
-        self.setMinimumSize(930, 600)
+        self.setMinimumSize(900, 610)
         layout = QVBoxLayout(self)
         layout.setContentsMargins(22, 18, 22, 18)
         layout.setSpacing(12)
         heading = QHBoxLayout()
         heading.addWidget(label("Финансы", "screenTitle"), 1)
+        self.import_button = button("Импорт выписки…", self.import_files)
+        heading.addWidget(self.import_button)
         heading.addWidget(button("Справочники…", self.open_directory))
         heading.addWidget(button("Экспорт…", self.export))
         self.primary = button("+ Операция", self.new_operation, primary=True)
@@ -370,11 +400,15 @@ class FinanceDialog(QDialog):
 
         filters = QHBoxLayout()
         self.range = ChoiceBox()
-        for key, text in (("month", "Последний месяц"), ("quarter", "3 месяца"),
+        for key, text in (("month", "Последний месяц"), ("week", "7 дней"), ("quarter", "3 месяца"),
                           ("all", "Весь период"), ("custom", "Свой период")):
             self.range.addItem(text, key)
         self.currency = ChoiceBox()
         self.currency.setAccessibleName("Валюта дашборда")
+        self.tag_filter = ChoiceBox()
+        self.tag_filter.setAccessibleName("Тег финансового отчёта")
+        self.tag_filter.setMinimumWidth(135)
+        self.tag_filter.setSizeAdjustPolicy(ChoiceBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
         today = QDate.currentDate()
         self.start, self.end = date_field(today.addMonths(-1).addDays(1).toString(Qt.DateFormat.ISODate)), date_field(
             today.toString(Qt.DateFormat.ISODate)
@@ -384,6 +418,8 @@ class FinanceDialog(QDialog):
             filters.addWidget(label(text))
             filters.addWidget(field)
         filters.addStretch(1)
+        filters.addWidget(label("Тег"))
+        filters.addWidget(self.tag_filter)
         filters.addWidget(label("Валюта"))
         filters.addWidget(self.currency)
         layout.addLayout(filters)
@@ -394,7 +430,7 @@ class FinanceDialog(QDialog):
             ("income", "Доходы за период", "financePositive"),
             ("expense", "Расходы за период", "financeExpense"),
             ("net", "Итог за период", "financeValue"),
-            ("free", "Свободно сейчас", "financeValue"),
+            ("free", "Свободно на счетах", "financeValue"),
         ):
             tile = frame("financeMetric")
             stack = QVBoxLayout(tile)
@@ -409,13 +445,17 @@ class FinanceDialog(QDialog):
         self.error.hide()
         layout.addWidget(self.error)
 
-        tabs = QTabWidget()
-        tabs.setObjectName("financeTabs")
-        tabs.addTab(self.build_dashboard(), "Итоги")
-        tabs.addTab(self.build_operations(), "Операции")
-        tabs.addTab(self.build_wallets(), "Кошельки и цели")
-        tabs.addTab(self.build_investments(), "Инвестиции и вклады")
-        layout.addWidget(tabs, 1)
+        self.tabs = QTabWidget()
+        self.tabs.setObjectName("financeTabs")
+        self.tabs.addTab(self.build_dashboard(), "Итоги")
+        self.operation_page = self.build_operations()
+        self.tabs.addTab(self.operation_page, "Операции")
+        self.tabs.addTab(self.build_wallets(), "Кошельки и цели")
+        self.debt_panel = DebtPanel(self)
+        self.debt_panel.catalog_changed.connect(self.updated_debt)
+        self.tabs.addTab(self.debt_panel, "Долги")
+        self.tabs.addTab(self.build_investments(), "Инвестиции и вклады")
+        layout.addWidget(self.tabs, 1)
         bottom = QHBoxLayout()
         bottom.addStretch(1)
         bottom.addWidget(button("Закрыть", self.accept))
@@ -424,8 +464,12 @@ class FinanceDialog(QDialog):
         self.start.dateChanged.connect(self.custom_dates)
         self.end.dateChanged.connect(self.custom_dates)
         self.currency.currentIndexChanged.connect(self.refresh)
+        self.tag_filter.currentIndexChanged.connect(self.refresh)
         self.update_currency()
+        self.update_tags()
         self.update_dates()
+        if show_operations:
+            self.tabs.setCurrentWidget(self.operation_page)
 
     @staticmethod
     def page():
@@ -439,20 +483,30 @@ class FinanceDialog(QDialog):
         widget, layout = self.page()
         self.chart = MonthlyChart()
         layout.addWidget(self.chart)
+        self.period_note = label(style="muted", wrap=True)
+        layout.addWidget(self.period_note)
         panels = QHBoxLayout()
         left, right = QVBoxLayout(), QVBoxLayout()
         panels.addLayout(left, 1)
         panels.addLayout(right, 1)
         section(left, "Доходы по источникам")
         section(right, "Расходы по статьям")
-        self.incomes = table(("Источник", "Сумма"), 0)
-        self.expenses = table(("Статья", "Сумма"), 0)
+        self.incomes = table(("Источник", "Сумма", "Доля"), 0)
+        self.expenses = table(("Статья", "Сумма", "Доля"), 0)
+        self.incomes.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.expenses.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.incomes.cellClicked.connect(lambda row, _: self.drill_down(self.incomes, row, "income"))
+        self.expenses.cellClicked.connect(lambda row, _: self.drill_down(self.expenses, row, "expense"))
         left.addWidget(self.incomes, 1)
         right.addWidget(self.expenses, 1)
         layout.addLayout(panels, 1)
         self.balances = label(style="muted", wrap=True)
         layout.addWidget(self.balances)
+        self.debt_notice = label(style="deadlineSoon", wrap=True)
+        layout.addWidget(self.debt_notice)
         actions = QHBoxLayout()
+        self.unclassified_button = button("Без статьи", self.show_unclassified)
+        actions.addWidget(self.unclassified_button)
         self.distribute_button = button("Распределить деньги…", self.distribute, primary=True)
         actions.addWidget(self.distribute_button)
         actions.addWidget(button("Разбор и регулярные платежи…", self.open_review))
@@ -465,22 +519,39 @@ class FinanceDialog(QDialog):
         widget, layout = self.page()
         top = QHBoxLayout()
         self.search = QLineEdit()
-        self.search.setPlaceholderText("Поиск по кошельку, статье или описанию")
+        self.search.setPlaceholderText("Поиск по описанию, статье, кошельку или тегу")
         self.search.setClearButtonEnabled(True)
         self.search.textChanged.connect(self.refresh_operations)
         top.addWidget(self.search, 1)
         top.addWidget(button("Выписки и сверка…", self.open_ledger))
         layout.addLayout(top)
-        self.operations = table(("Дата", "Кошелёк", "Вид", "Статья / источник", "Сумма", "Описание"), 5)
-        self.operations.cellDoubleClicked.connect(lambda *_: self.edit_operation())
+        self.filter_notice = button("", self.clear_article_filter)
+        layout.addWidget(self.filter_notice, alignment=Qt.AlignmentFlag.AlignLeft)
+        self.operations = table(("Дата", "Кошелёк", "Вид", "Сумма", "Статья  ▾", "Описание", "Теги  ▾"), 5)
+        self.operations.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        self.operations.setItemDelegateForColumn(self.TAGS, TagCells(self.operations))
+        for column, width in ((1, 120), (self.ARTICLE, 163), (self.TAGS, 130)):
+            self.operations.horizontalHeader().setSectionResizeMode(column, QHeaderView.ResizeMode.Interactive)
+            self.operations.setColumnWidth(column, width)
+        self.operations.cellClicked.connect(self.operation_clicked)
+        self.operations.cellDoubleClicked.connect(self.operation_double_clicked)
+        self.category_shortcut = QShortcut(QKeySequence("F2"), self.operations)
+        self.category_shortcut.activated.connect(self.classify_selected)
         layout.addWidget(self.operations, 1)
         controls = QHBoxLayout()
         self.operation_count = label(style="muted")
         controls.addWidget(self.operation_count, 1)
         self.edit_button = button("Изменить…", self.edit_operation)
         controls.addWidget(self.edit_button)
-        self.classify_button = button("Статья…", self.classify_operation)
+        self.classify_button = button("Статья…", self.classify_selected)
         controls.addWidget(self.classify_button)
+        self.tags_button = button("Теги…", self.tag_selected)
+        controls.addWidget(self.tags_button)
+        self.rule_button = button("Правило…", self.classify_operation)
+        controls.addWidget(self.rule_button)
+        self.debt_button = button("К долгу…", self.debt_for_operation)
+        controls.addWidget(self.debt_button)
+        self.operations.itemSelectionChanged.connect(self.update_operation_buttons)
         layout.addLayout(controls)
         return widget
 
@@ -543,7 +614,9 @@ class FinanceDialog(QDialog):
             start, end = min(posted, default=today), max([today, *posted])
         else:
             end = today
-            start = today.addMonths(-3 if selected == "quarter" else -1).addDays(1)
+            start = today.addDays(-6) if selected == "week" else today.addMonths(
+                -3 if selected == "quarter" else -1
+            ).addDays(1)
         self.start.blockSignals(True)
         self.end.blockSignals(True)
         self.start.setDate(start)
@@ -555,6 +628,7 @@ class FinanceDialog(QDialog):
     def update_currency(self):
         current = self.currency.currentData() or "RUB"
         codes = {asset.currency for asset in self.catalog.assets} | {fund.currency for fund in self.catalog.funds.funds}
+        codes.update(item.currency for item in self.catalog.review.debts.items)
         self.currency.blockSignals(True)
         self.currency.clear()
         for currency in sorted(codes or {"RUB"}):
@@ -563,19 +637,32 @@ class FinanceDialog(QDialog):
         self.currency.setCurrentIndex(max(0, index))
         self.currency.blockSignals(False)
 
+    def update_tags(self):
+        current = self.tag_filter.currentData() or ""
+        self.tag_filter.blockSignals(True)
+        self.tag_filter.clear()
+        self.tag_filter.addItem("Все теги", "")
+        for name in self.catalog.review.available_tags():
+            self.tag_filter.addItem(name, name)
+        self.tag_filter.setCurrentIndex(max(0, self.tag_filter.findData(current)))
+        self.tag_filter.blockSignals(False)
+
     def refresh(self):
         currency = self.currency.currentData() or "RUB"
         try:
             start, end = self.bounds()
-            self.rows = activity(self.catalog.ledger, self.catalog.review, start, end, currency)
+            self.rows = activity(self.catalog.ledger, self.catalog.review, start, end, currency,
+                                 tag=self.tag_filter.currentData())
         except ValueError as exc:
             self.rows = ()
+            self.period_note.hide()
             self.chart.set_period((), field_date(self.end), field_date(self.end))
             self.error.setText(str(exc))
             self.error.show()
         else:
             self.error.hide()
             self.chart.set_period(self.rows, start, end)
+            self.compare_period(start, end, currency)
         income, expense = flow_totals(self.rows)
         cash = self.catalog.liquid_totals().get(currency, 0)
         reserved = self.catalog.funds.reserved().get(currency, 0)
@@ -583,38 +670,135 @@ class FinanceDialog(QDialog):
                             ("free", cash - reserved)):
             self.metrics[name].setText(display(value, currency))
         totals = flow_breakdown(self.rows)
-        for key, widget in (("income", self.incomes), ("expense", self.expenses)):
+        for key, widget, total in (("income", self.incomes, income), ("expense", self.expenses, expense)):
             breakdown = [(category, value) for (_, kind, category), value in totals.items()
                          if kind == key]
-            fill_table(widget, [(category, display(value, currency)) for category, value in
+            fill_table(widget, [(category, display(value, currency), f"{value / total:.0%}") for category, value in
                                 sorted(breakdown, key=lambda item: (-item[1], item[0]))])
         self.balances.setText(
             f"На счетах сейчас: {display(cash, currency)}  ·  Отложено: {display(reserved, currency)}"
         )
+        missing = sum(self.is_unclassified(row) for row in self.rows)
+        self.unclassified_button.setText(f"Без статьи · {missing}")
+        self.unclassified_button.setVisible(bool(missing))
+        self.show_debt_notice(currency)
         self.refresh_operations()
         self.refresh_positions(currency)
         self.refresh_goals(currency)
+        self.debt_panel.refresh(self.catalog, currency)
         self.primary.setEnabled(self.catalog.editable)
+        self.import_button.setEnabled(self.catalog.editable)
         for control in (self.distribute_button, self.goals_distribute):
             control.setEnabled(self.catalog.editable and self.error.isHidden())
-        self.edit_button.setEnabled(self.catalog.editable)
-        self.classify_button.setEnabled(self.catalog.editable)
+
+    def compare_period(self, start, end, currency):
+        first, last = date.fromisoformat(start), date.fromisoformat(end)
+        width = (last - first).days + 1
+        if first.toordinal() <= width or self.range.currentData() == "all":
+            self.period_note.hide()
+            return
+        previous = activity(
+            self.catalog.ledger, self.catalog.review, (first - timedelta(days=width)).isoformat(),
+            (first - timedelta(days=1)).isoformat(), currency, tag=self.tag_filter.currentData(),
+        )
+        _, expense = flow_totals(self.rows)
+        _, previous_expense = flow_totals(previous)
+        if not previous_expense:
+            self.period_note.hide()
+            return
+        difference = expense - previous_expense
+        if difference:
+            direction = "выше" if difference > 0 else "ниже"
+            text = f"Расходы на {display(abs(difference), currency)} {direction}, чем за предыдущие {width} дн."
+        else:
+            text = f"Расходы такие же, как за предыдущие {width} дн."
+        self.period_note.setText(text)
+        self.period_note.show()
+
+    def show_debt_notice(self, currency):
+        debts = self.catalog.review.debts
+        balances = debts.balances()
+        today = date.today()
+        soon = (today + timedelta(days=7)).isoformat()
+        due = overdue = 0
+        for item in debts.items:
+            if item.direction != "borrowed" or item.currency != currency or not item.due:
+                continue
+            if item.due < today.isoformat():
+                overdue += balances[item.number]
+            elif item.due <= soon:
+                due += balances[item.number]
+        parts = []
+        if overdue:
+            parts.append(f"Просрочено к возврату {display(overdue, currency)}")
+        if due:
+            parts.append(f"Вернуть в ближайшие 7 дней {display(due, currency)}")
+        self.debt_notice.setText(" · ".join(parts))
+        self.debt_notice.setVisible(bool(parts))
 
     def refresh_operations(self):
+        selected = self.selected_operation()
         query = self.search.text().casefold().split()
         titles = {asset.asset_number: asset.title for asset in self.catalog.assets}
-        self.filtered = tuple(row for row in self.rows if all(
-            word in f"{titles[row.account]} {row.category} {row.description} {row.recipient}".casefold()
-            for word in query
-        ))
+        self.filtered = tuple(row for row in self.rows if self.matches_article(row) and all(
+            word in f"{titles[row.account]} {row.category} {row.description} {row.recipient} {' '.join(row.tags)}".casefold()
+            for word in query))
+        self.operations.blockSignals(True)
         fill_table(self.operations, [
-            (row.day, titles[row.account], FLOW_LABELS[row.kind], row.category, display(row.amount, row.currency),
-             row.description + (f" · комиссия {amount_text(row.fee)}" if row.fee else ""))
+            (row.day, titles[row.account], FLOW_LABELS[row.kind], display(row.amount, row.currency),
+             row.category, row.description + (f" · комиссия {amount_text(row.fee)}" if row.fee else ""),
+             ", ".join(row.tags))
             for row in self.filtered
         ])
-        self.operation_count.setText(f"Операций: {len(self.filtered)}")
-        if self.filtered:
-            self.operations.selectRow(0)
+        for index, row in enumerate(self.filtered):
+            tag = self.operations.item(index, self.TAGS)
+            tag.setData(TAG_NAMES, row.tags)
+            if not self.catalog.editable:
+                continue
+            article = self.operations.item(index, self.ARTICLE)
+            if row.kind in ("income", "expense"):
+                article.setText(("Выбрать" if self.is_unclassified(row) else row.category) + "  ▾")
+                article.setForeground(QColor("#146951"))
+            tag.setText((", ".join(row.tags) if row.tags else "+ Тег") + "  ▾")
+            tag.setForeground(QColor("#146951"))
+        if selected:
+            index = next((i for i, row in enumerate(self.filtered) if row.number == selected.number), None)
+            if index is not None:
+                self.operations.selectRow(index)
+        self.operations.blockSignals(False)
+        self.update_operation_buttons()
+        self.filter_notice.setVisible(self.article_filter is not None)
+        if self.article_filter is not None:
+            self.filter_notice.setText(self.article_filter[1].replace("&", "&&") + "  ×")
+
+    @staticmethod
+    def is_unclassified(row):
+        return row.kind in ("income", "expense") and row.category == UNCATEGORIZED
+
+    def matches_article(self, row):
+        if self.article_filter is None:
+            return True
+        kind, category = self.article_filter
+        if kind == "missing":
+            return self.is_unclassified(row)
+        amount = row.income if kind == "income" else row.expense
+        return bool(amount and (("Комиссии банка" if row.fee else row.category) == category))
+
+    def drill_down(self, widget, index, kind):
+        self.open_article_filter(kind, widget.item(index, 0).text())
+
+    def show_unclassified(self):
+        self.open_article_filter("missing", UNCATEGORIZED)
+
+    def open_article_filter(self, kind, category):
+        self.article_filter = kind, category
+        self.search.clear()
+        self.tabs.setCurrentWidget(self.operation_page)
+        self.refresh_operations()
+
+    def clear_article_filter(self):
+        self.article_filter = None
+        self.refresh_operations()
 
     def refresh_positions(self, currency):
         assets = [self.catalog.recorded_value(asset) for asset in self.catalog.assets
@@ -665,8 +849,11 @@ class FinanceDialog(QDialog):
     def use_catalog(self, catalog, *, currency=None):
         self.catalog = catalog
         self.update_currency()
+        self.update_tags()
         if currency:
+            self.currency.blockSignals(True)
             self.currency.setCurrentIndex(self.currency.findData(currency))
+            self.currency.blockSignals(False)
         if self.range.currentData() == "all":
             self.update_dates()
         else:
@@ -681,30 +868,133 @@ class FinanceDialog(QDialog):
 
     def new_operation(self):
         accounts = [asset for asset in self.catalog.assets if asset.category == "account" and asset.status == "active"]
-        account = next((asset.asset_number for asset in accounts if asset.currency == self.currency.currentData()), None)
+        available = {asset.asset_number for asset in accounts if asset.currency == self.currency.currentData()}
+        account = next((entry.account for entry in reversed(self.catalog.ledger.entries) if entry.source == "manual"
+                        and entry.account in available), min(available, default=None))
         if not accounts:
             account = self.new_wallet()
             if account is None:
                 return
         dialog = OperationEditor(self, self.catalog, account=account)
         if dialog.exec() == QDialog.DialogCode.Accepted:
-            entry = dialog.catalog.ledger.entries[-1]
-            currency = dialog.catalog.ledger.opening(entry.account).currency
-            self.use_catalog(dialog.catalog, currency=currency)
-            if not field_date(self.start) <= entry.day <= field_date(self.end):
-                self.start.setDate(min(self.start.date(), QDate.fromString(entry.day, Qt.DateFormat.ISODate)))
-                self.end.setDate(max(self.end.date(), QDate.fromString(entry.day, Qt.DateFormat.ISODate)))
+            self.show_posted(dialog.catalog)
+
+    def show_posted(self, catalog):
+        entries = catalog.ledger.entries[len(self.catalog.ledger.entries):]
+        if not entries:
+            self.use_catalog(catalog)
+            return
+        self.article_filter = None
+        self.search.blockSignals(True)
+        self.search.clear()
+        self.search.blockSignals(False)
+        self.tag_filter.blockSignals(True)
+        self.tag_filter.setCurrentIndex(0)
+        self.tag_filter.blockSignals(False)
+        self.use_catalog(catalog, currency=catalog.ledger.opening(entries[-1].account).currency)
+        start, end = min(entry.day for entry in entries), max(entry.day for entry in entries)
+        if start < field_date(self.start) or end > field_date(self.end):
+            self.start.blockSignals(True)
+            self.end.blockSignals(True)
+            self.start.setDate(min(self.start.date(), QDate.fromString(start, Qt.DateFormat.ISODate)))
+            self.end.setDate(max(self.end.date(), QDate.fromString(end, Qt.DateFormat.ISODate)))
+            self.start.blockSignals(False)
+            self.end.blockSignals(False)
+            self.custom_dates()
+        self.tabs.setCurrentWidget(self.operation_page)
+
+    def import_files(self):
+        updated = import_statements(self, self.catalog)
+        if updated is not self.catalog:
+            self.show_posted(updated)
 
     def selected_operation(self):
         index = self.operations.currentRow()
-        return self.filtered[index] if 0 <= index < len(self.filtered) else None
+        return self.filtered[index] if 0 <= index < len(self.filtered) and self.operations.item(index, 0) else None
+
+    def selected_operations(self):
+        return tuple(self.filtered[index.row()] for index in self.operations.selectionModel().selectedRows())
+
+    def update_operation_buttons(self):
+        rows = self.selected_operations()
+        one = rows[0] if len(rows) == 1 else None
+        editable = self.catalog.editable
+        kinds = {row.kind for row in rows}
+        category_possible = editable and len(kinds) == 1 and kinds <= {"expense", "income"}
+        self.classify_button.setEnabled(category_possible)
+        ordinary = bool(one and one.kind in ("income", "expense"))
+        self.edit_button.setEnabled(editable and one is not None)
+        self.rule_button.setEnabled(editable and ordinary)
+        self.tags_button.setEnabled(editable and bool(rows))
+        self.debt_button.setEnabled(editable and ordinary and
+                                    all(move.operation != one.number for move in self.catalog.funds.movements))
+        self.operation_count.setText(f"Выбрано {len(rows)} из {len(self.filtered)}" if len(rows) > 1
+                                     else f"Операций: {len(self.filtered)}")
+
+    def operation_clicked(self, index, column):
+        if not self.catalog.editable or selecting_rows():
+            return
+        row = self.filtered[index]
+        if column == self.ARTICLE and row.kind in ("income", "expense"):
+            item = self.operations.item(index, column)
+            point = self.operations.viewport().mapToGlobal(self.operations.visualItemRect(item).bottomLeft())
+            self.set_article((row,), point)
+        elif column == self.TAGS:
+            self.set_tags((row,))
+
+    def operation_double_clicked(self, _, column):
+        if column not in (self.ARTICLE, self.TAGS):
+            self.edit_operation()
+
+    def set_article(self, rows, point):
+        first = rows[0]
+        direction = 1 if first.kind == "income" else -1
+        entry = self.catalog.ledger.entries[first.number - 1]
+        suggestion = self.catalog.directory.suggestion(self.catalog.review, entry)
+        result = category_menu(self, point, self.catalog, direction, first.category,
+                               suggestion=suggestion.category if suggestion and len(rows) == 1 else "")
+        if result is not None:
+            name, directory = result
+            review = self.catalog.review.classify(tuple(row.number for row in rows), name)
+            self.save_classification(review, directory)
+
+    def classify_selected(self):
+        if self.classify_button.isEnabled():
+            point = self.classify_button.mapToGlobal(self.classify_button.rect().bottomLeft())
+            self.set_article(self.selected_operations(), point)
+
+    def set_tags(self, rows):
+        initial = rows[0].tags if len(rows) == 1 else ()
+        names = choose_tags(self, known=self.catalog.review.available_tags(), initial=initial, count=len(rows))
+        if names is not None:
+            review = self.catalog.review.tag_operations({row.number: names for row in rows}, extend=len(rows) > 1)
+            self.save_classification(review, self.catalog.directory)
+
+    def tag_selected(self):
+        rows = self.selected_operations()
+        if rows and self.catalog.editable:
+            self.set_tags(rows)
+
+    def save_classification(self, review, directory):
+        if (review, directory) == (self.catalog.review, self.catalog.directory):
+            return
+        try:
+            self.use_catalog(self.catalog.save_directory(directory, review))
+        except (OSError, ValueError) as exc:
+            QMessageBox.warning(self, "Операция", str(exc))
 
     def edit_operation(self):
         if not self.catalog.editable or (row := self.selected_operation()) is None:
             return
         entry = self.catalog.ledger.entries[row.number - 1]
         used = any(move.operation == row.number for move in self.catalog.funds.movements)
-        if entry.source != "manual" or used or row.kind == "transfer":
+        if row.kind == "debt":
+            self.tabs.setCurrentWidget(self.debt_panel)
+            return
+        if row.kind == "transfer":
+            self.open_review()
+            return
+        if entry.source != "manual" or used:
             self.classify_operation()
             return
         dialog = OperationEditor(self, self.catalog, number=row.number)
@@ -714,15 +1004,38 @@ class FinanceDialog(QDialog):
     def classify_operation(self):
         if not self.catalog.editable or (row := self.selected_operation()) is None:
             return
-        if row.kind == "transfer":
-            QMessageBox.information(self, "Связанный перевод", "Для изменения связи откройте «Разбор операций».")
+        if row.kind not in ("income", "expense"):
             return
         dialog = CategoryDialog(self, self.catalog, row.number)
         if dialog.exec() == QDialog.DialogCode.Accepted:
-            try:
-                self.use_catalog(self.catalog.save_review(dialog.result_review))
-            except (OSError, ValueError) as exc:
-                QMessageBox.warning(self, "Статья", str(exc))
+            self.save_classification(dialog.result_review, dialog.result_directory)
+
+    def debt_for_operation(self):
+        if not self.debt_button.isEnabled():
+            return
+        row = self.selected_operation()
+        menu = QMenu(self)
+        create = menu.addAction("Создать долг из операции…")
+        choices = {}
+        balances = self.catalog.review.debts.balances()
+        for debt in self.catalog.review.debts.items:
+            if debt.currency == row.currency and debt.day <= row.day and row.amount * ISSUE_SIGN[debt.direction] < 0:
+                if balances[debt.number] > 0:
+                    action = menu.addAction("Возврат · " + debt.title.replace("&", "&&"))
+                    choices[action] = debt
+        action = menu.exec(self.debt_button.mapToGlobal(self.debt_button.rect().bottomLeft()))
+        if action is None:
+            return
+        dialog = DebtEditor(self, self.catalog, row.currency, debt=None if action == create else choices[action],
+                            operation_number=row.number)
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            self.updated_debt(dialog.catalog)
+            self.tabs.setCurrentWidget(self.debt_panel)
+
+    def updated_debt(self, catalog):
+        items = catalog.review.debts.items
+        currency = items[-1].currency if len(items) > len(self.catalog.review.debts.items) else None
+        self.use_catalog(catalog, currency=currency)
 
     def new_goal(self):
         dialog = GoalDialog(self, self.catalog, self.currency.currentData())
@@ -770,7 +1083,7 @@ class FinanceDialog(QDialog):
     def open_ledger(self):
         dialog = LedgerDialog(self, self.catalog)
         dialog.exec()
-        self.use_catalog(dialog.catalog)
+        self.show_posted(dialog.catalog)
 
     def open_review(self):
         dialog = ReviewDialog(self, self.catalog)
@@ -799,4 +1112,4 @@ class FinanceDialog(QDialog):
         except ValueError as exc:
             QMessageBox.warning(self, "Период", str(exc))
             return
-        ExportDialog(self, self.catalog, start, end).exec()
+        ExportDialog(self, self.catalog, start, end, tag=self.tag_filter.currentData()).exec()

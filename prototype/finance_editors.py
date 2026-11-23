@@ -8,10 +8,11 @@ from PySide6.QtWidgets import (
     QListWidget, QListWidgetItem, QMessageBox, QVBoxLayout,
 )
 
-from appearance import ChoiceBox, button, label
+from appearance import ChoiceBox, TagEditor, button, label
 from assets import Asset, amount_text, parse_amount
-from finance import Directory
+from documents import tag_names
 from ledger import Entry
+from operation_controls import CategoryField
 from review import is_business
 
 
@@ -47,34 +48,51 @@ def form_dialog(dialog, title, caption="Сохранить"):
 
 
 class WalletEditor(QDialog):
-    def __init__(self, parent, catalog):
+    def __init__(self, parent, catalog, *, stage=False, title="", bank="", currency="RUB",
+                 opening_from_pdf=False, opening_required=False, snapshot_day=None):
         super().__init__(parent)
         self.catalog = catalog
+        self.stage = stage
+        self.bank = bank
+        self.opening_required = opening_required
         form, self.error = form_dialog(self, "Новый кошелёк или счёт")
-        self.title = QLineEdit()
+        self.title = QLineEdit(title)
         self.title.setPlaceholderText("Например, Наличные или Карта")
         self.kind = ChoiceBox()
         self.kind.addItems(("Наличные", "Текущий счёт", "Накопительный счёт", "Вклад", "Счёт ИП"))
         self.owner = QLineEdit("Семья" if catalog.scope == "family" else "Я")
-        self.currency = QLineEdit("RUB")
+        if stage:
+            self.kind.setCurrentText("Текущий счёт")
+        self.currency = QLineEdit(currency)
         self.currency.setMaxLength(3)
+        self.currency.setReadOnly(opening_from_pdf)
         self.amount = QLineEdit()
-        self.amount.setPlaceholderText("По желанию")
-        self.snapshot = date_field((date.today() - timedelta(days=1)).isoformat())
+        self.amount.setPlaceholderText("Укажите сумму, можно 0" if opening_required else "По желанию")
+        self.snapshot = date_field(snapshot_day or (date.today() - timedelta(days=1)).isoformat())
         for text, field in (
             ("Название", self.title), ("Тип", self.kind), ("Владелец", self.owner),
             ("Валюта", self.currency), ("Остаток на конец дня", self.amount), ("Дата остатка", self.snapshot),
         ):
             form.addRow(text, field)
+        form.setRowVisible(self.amount, not opening_from_pdf)
+        form.setRowVisible(self.snapshot, not opening_from_pdf)
+        self.title.selectAll()
         self.title.setFocus()
 
     def save(self):
         try:
             amount = parse_amount(self.amount.text())
+            if self.opening_required and amount is None:
+                raise ValueError("Для CSV укажите начальный остаток, в том числе нулевой.")
             account = Asset(self.title.text().strip(), "account", self.owner.text().strip(),
-                            kind=self.kind.currentText(), currency=self.currency.text().strip().upper(),
+                            kind=self.kind.currentText(), organization=self.bank,
+                            currency=self.currency.text().strip().upper(),
                             amount=amount, as_of=field_date(self.snapshot) if amount is not None else "")
-            self.catalog = self.catalog.add_asset(account)
+            if self.stage:
+                account.validate(set())
+                self.catalog = self.catalog.stage_asset(account)
+            else:
+                self.catalog = self.catalog.add_asset(account)
         except (OSError, ValueError) as exc:
             self.error.setText(str(exc))
             self.error.show()
@@ -114,9 +132,10 @@ class OperationEditor(QDialog):
         self.fee.setPlaceholderText("0,00")
         self.fund = ChoiceBox()
         self.fund.setAccessibleName("Оплата из фонда")
-        self.category = ChoiceBox()
-        self.category.setEditable(True)
-        self.category.toggle.raise_()
+        tag_values = catalog.review.tags_by_operation().get(number, ())
+        self.tags = TagEditor(", ".join(tag_values), suggestions=catalog.review.available_tags())
+        self.category = CategoryField(catalog, 1 if old and old.amount > 0 else -1,
+                                      assigned.category if assigned else "")
         self.description = QLineEdit(old.description if old else "")
         self.recipient = QLineEdit(old.recipient if old else "")
         self.prior = QLineEdit()
@@ -126,7 +145,7 @@ class OperationEditor(QDialog):
         for caption, field in (
             ("Вид операции", self.kind), ("Дата", self.day), ("Кошелёк", self.account),
             ("Куда", self.other), ("Сумма", self.amount), ("Комиссия", self.fee), ("Оплатить из", self.fund),
-            ("Статья или источник", self.category), ("Описание", self.description),
+            ("Статья или источник", self.category), ("Теги", self.tags), ("Описание", self.description),
             ("Получатель / отправитель", self.recipient), ("До первой операции", self.prior),
             ("На втором кошельке было", self.other_prior), ("Поступление ИП", self.taxable),
         ):
@@ -135,8 +154,6 @@ class OperationEditor(QDialog):
         self.account.currentIndexChanged.connect(self.refresh_accounts)
         self.other.currentIndexChanged.connect(self.refresh_openings)
         self.refresh_kind()
-        if assigned:
-            self.category.setCurrentText(assigned.category)
         self.amount.setFocus()
 
     def refresh_kind(self):
@@ -146,13 +163,9 @@ class OperationEditor(QDialog):
         self.form.setRowVisible(self.fee, transfer)
         self.form.setRowVisible(self.other, transfer)
         direction = 1 if self.kind.currentData() == "income" else -1
-        self.category.clear()
-        self.category.addItem("")
-        self.category.addItems([
-            item.name for item in self.catalog.directory.effective(self.catalog.ledger, self.catalog.review)
-            if item.direction == direction and not item.archived
-        ])
-        self.category.lineEdit().setPlaceholderText("Выберите или введите своё название")
+        if direction != self.category.direction and not transfer:
+            self.category.direction = direction
+            self.category.set_value("")
         self.refresh_accounts()
 
     def refresh_accounts(self):
@@ -202,6 +215,7 @@ class OperationEditor(QDialog):
             account = self.account.currentData()
             day = field_date(self.day)
             kind = self.kind.currentData()
+            tags = tag_names(self.tags.value())
             prior = parse_amount(self.prior.text()) if not self.prior.isHidden() else None
             if kind == "transfer":
                 other = self.other.currentData()
@@ -214,10 +228,10 @@ class OperationEditor(QDialog):
                 other_prior = parse_amount(self.other_prior.text()) if not self.other_prior.isHidden() else None
                 self.catalog = self.catalog.record_transfer(
                     Entry(account, day, -(amount + fee), description), Entry(other, day, amount, description),
-                    debit_prior=prior, credit_prior=other_prior,
+                    debit_prior=prior, credit_prior=other_prior, tags=tags,
                 )
             else:
-                category = self.category.currentText().strip()
+                category = self.category.value
                 description = self.description.text().strip() or category or ("Доход" if kind == "income" else "Расход")
                 taxable = not self.taxable.isHidden() and self.taxable.isChecked()
                 if taxable and not category:
@@ -226,7 +240,8 @@ class OperationEditor(QDialog):
                               recipient=self.recipient.text().strip())
                 self.catalog = self.catalog.record_manual(entry, category, prior=prior,
                                                           number=self.number, taxable=taxable,
-                                                          fund=None if self.fund.isHidden() else self.fund.currentData())
+                                                          fund=None if self.fund.isHidden() else self.fund.currentData(),
+                                                          tags=tags, directory=self.category.catalog.directory)
         except (OSError, ValueError) as exc:
             self.error.setText(str(exc))
             self.error.show()

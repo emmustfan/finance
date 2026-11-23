@@ -210,7 +210,7 @@ class FundsDialog(QDialog):
 
     def choose_operation(self, *, income, currency=None):
         ledger = self.catalog.ledger
-        used = {item.operation for item in self.catalog.funds.movements} | self.catalog.review.linked
+        used = {item.operation for item in self.catalog.funds.movements} | self.catalog.review.fixed_operations
         names = {asset.asset_number: asset.title for asset in self.catalog.assets}
         choices = {}
         for number, entry in reversed(tuple(enumerate(ledger.entries, 1))):

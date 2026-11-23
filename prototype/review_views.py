@@ -13,6 +13,7 @@ from appearance import ChoiceBox, button, label
 from assets import amount_text, parse_amount
 from ledger import _normalized
 from ledger_views import table
+from operation_controls import CategoryField
 from review import Assignment, Recurring, Rule, RULE_FIELDS, TAX_PAYMENT, TRANSFER_WORDS, is_business, period
 
 
@@ -54,21 +55,16 @@ class CategoryDialog(QDialog):
     def __init__(self, parent, catalog, number):
         super().__init__(parent)
         self.result_review = None
+        self.result_directory = catalog.directory
         entry = catalog.ledger.entries[number - 1]
         review = catalog.review
         previous = review.assignments_by_operation().get(number)
         suggestion = catalog.directory.suggestion(review, entry)
         category = previous.category if previous else suggestion.category if suggestion else ""
         layout, form, _ = inputs(self, "Подтвердить статью", ())
-        self.category_choice = ChoiceBox()
-        self.category_choice.setEditable(True)
-        self.category_choice.toggle.raise_()
-        self.category_choice.addItem("")
-        self.category_choice.addItems([
-            item.name for item in catalog.directory.effective(catalog.ledger, review)
-            if item.direction == (1 if entry.amount > 0 else -1) and not item.archived
-        ])
-        self.category_choice.setCurrentText(category)
+        direction = 1 if entry.amount > 0 else -1
+        self.category_choice = CategoryField(catalog, direction, category,
+                                             suggestion=suggestion.category if suggestion else "")
         form.addRow("Статья или источник", self.category_choice)
         if suggestion:
             layout.addWidget(label(suggestion.reason, "muted", wrap=True))
@@ -84,21 +80,19 @@ class CategoryDialog(QDialog):
             if value:
                 self.rule.addItem(f"{title}: {value}", field)
         form.addRow("Правило на будущее", self.rule)
+
         def save():
-            value = self.category_choice.currentText().strip()
-            if not value or len(value) > 100:
-                QMessageBox.warning(self, "Статья", "Введите статью дохода или расхода до 100 символов.")
-                return
-            found = catalog.directory.lookup(1 if entry.amount > 0 else -1, value)
-            if found and found.archived and (previous is None or previous.category != found.name):
-                QMessageBox.warning(self, "Статья", "Верните её в справочнике или выберите действующую статью.")
-                return
-            value = found.name if found else value
-            updated = review.assign((Assignment(number, value, self.taxable.isChecked()),))
+            value = self.category_choice.value
             field = self.rule.currentData()
+            if not value and (self.taxable.isChecked() or field):
+                QMessageBox.warning(self, "Статья", "Выберите статью для правила или налогового резерва.")
+                return
+            updated = (review.assign((Assignment(number, value, self.taxable.isChecked()),)) if value
+                       else review.classify((number,), ""))
             if field:
-                updated = updated.learn(Rule(field, getattr(entry, field), 1 if entry.amount > 0 else -1, value))
+                updated = updated.learn(Rule(field, getattr(entry, field), direction, value))
             self.result_review = updated
+            self.result_directory = self.category_choice.catalog.directory
             self.accept()
         close_bar(self, layout, save, "Подтвердить")
 
@@ -235,6 +229,7 @@ class ReviewDialog(QDialog):
         selected = self.selected()
         review, ledger = self.catalog.review, self.catalog.ledger
         assigned, linked = review.assignments_by_operation(), review.linked
+        debt_moves = review.debts.movements()
         self.numbers = sorted(
             (number for number, entry in enumerate(ledger.entries, 1) if start <= entry.day <= end),
             key=lambda number: (ledger.entries[number - 1].day, number), reverse=True,
@@ -246,6 +241,9 @@ class ReviewDialog(QDialog):
             reason = ""
             if number in linked:
                 status = "Связанный перевод"
+            elif number in debt_moves:
+                status = debt_moves[number][1]
+                reason = "Связано с долгом"
             elif number in assigned:
                 status = assigned[number].category
                 reason = "Подтверждено" + (" · Облагаемое ИП" if assigned[number].taxable else "")
@@ -272,9 +270,11 @@ class ReviewDialog(QDialog):
         row = self.grid.currentRow()
         return self.numbers[row] if 0 <= row < len(self.numbers) else None
 
-    def save(self, review):
+    def save(self, review, directory=None):
         try:
-            if review != self.catalog.review:
+            if directory is not None and directory != self.catalog.directory:
+                self.catalog = self.catalog.save_directory(directory, review)
+            elif review != self.catalog.review:
                 self.catalog = self.catalog.save_review(review)
         except (OSError, ValueError) as exc:
             QMessageBox.warning(self, "Операция не выполнена", str(exc))
@@ -283,15 +283,15 @@ class ReviewDialog(QDialog):
 
     def category(self):
         number = self.selected()
-        if number is None or number in self.catalog.review.linked:
+        if number is None or number in self.catalog.review.fixed_operations:
             return
         dialog = CategoryDialog(self, self.catalog, number)
         if dialog.exec() == QDialog.DialogCode.Accepted:
-            self.save(dialog.result_review)
+            self.save(dialog.result_review, dialog.result_directory)
 
     def transfer(self):
         number = self.selected()
-        if number is None or number in self.catalog.review.linked:
+        if number is None or number in self.catalog.review.fixed_operations:
             return
         ledger, review = self.catalog.ledger, self.catalog.review
         candidates = review.transfer_candidates(ledger, number)
@@ -320,7 +320,7 @@ class ReviewDialog(QDialog):
     def manual_transfer(self):
         number = self.selected()
         ledger, review = self.catalog.ledger, self.catalog.review
-        if number is None or number in review.linked or len(ledger.entries) < 2:
+        if number is None or number in review.fixed_operations or len(ledger.entries) < 2:
             return
         other, ok = QInputDialog.getInt(
             self, "Связать перевод", "Номер второй операции из журнала",
@@ -348,7 +348,7 @@ class ReviewDialog(QDialog):
 
     def batch(self):
         review, ledger = self.catalog.review, self.catalog.ledger
-        excluded = review.linked | set(review.waiting) | review.assignments_by_operation().keys()
+        excluded = review.fixed_operations | set(review.waiting) | review.assignments_by_operation().keys()
         rows = []
         for number in self.numbers:
             entry = ledger.entries[number - 1]

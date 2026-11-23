@@ -305,15 +305,15 @@ class Preview:
     balance: BankBalance | None
     balance_warning: str = ""
 
+    def accepted_rows(self, confirmed: set[int]) -> tuple[PreviewRow, ...]:
+        return tuple(row for row in self.rows if row.entry is not None and (
+            row.state == "new" or (row.state == "review" and row.line in confirmed)
+        ))
+
     def apply(self, ledger: Ledger, confirmed: set[int]) -> Ledger:
         if ImportedFile(self.account, self.digest) in ledger.files:
             return ledger
-        entries = tuple(
-            row.entry for row in self.rows
-            if row.entry is not None and (
-                row.state == "new" or (row.state == "review" and row.line in confirmed)
-            )
-        )
+        entries = tuple(row.entry for row in self.accepted_rows(confirmed))
         if not entries and self.balance is None:
             return ledger
         file = ImportedFile(self.account, self.digest)

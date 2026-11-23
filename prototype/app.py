@@ -2,6 +2,7 @@
 
 import subprocess
 import sys
+from datetime import date, timedelta
 from html import escape
 from io import BytesIO
 from pathlib import Path
@@ -24,14 +25,14 @@ from PIL import Image
 from appearance import ChoiceBox, TagEditor, TagFlow, apply_style, area, button, clear_tags, frame, label, tag_button
 from asset_views import RegistryDialog, launch_keepass
 from assets import Asset
-from documents import CARD_FIELDS, MAX_ATTACHMENT_BYTES, SCOPES, Card, Catalog, Photo, read_pdf, read_photo, tag_names
+from documents import (
+    CARD_FIELDS, MAX_ATTACHMENT_BYTES, SCOPES, Card, Catalog, Photo, document_deadline, read_pdf, read_photo, tag_names,
+)
 from finance_views import FinanceDialog
-from fund_views import FundsDialog
 from funds import Fund, Funds, Line, Template
 from ledger import Ledger, Opening
-from ledger_views import LedgerDialog
+from ledger_views import import_statements
 from review import Recurring, Review
-from review_views import ReviewDialog
 from sample import sample_pdf
 from vault import copy_verified
 
@@ -230,12 +231,13 @@ class DocumentTypeBox(ChoiceBox):
 
 
 class CardDialog(QDialog):
-    def __init__(self, parent, kinds: tuple[str, ...], card: Card | None):
+    def __init__(self, parent, kinds: tuple[str, ...], card: Card | None, *, tag_suggestions=()):
         super().__init__(parent)
         self.setWindowTitle("Изменить карточку" if card is not None else "Новый документ")
         self.resize(710, 600)
         self.pdf = card.pdf if card is not None else None
         self.pdf_name = "PDF"
+        self.original_expiry = card.expires if card is not None else ""
         self.photos = card.photos if card is not None else ()
         self.card: Card | None = None
         self.inputs: dict[str, QLineEdit | QComboBox] = {}
@@ -271,7 +273,7 @@ class CardDialog(QDialog):
         document.addStretch(1)
 
         original.addWidget(label("Теги", "sectionTitle"))
-        self.tag_editor = TagEditor(card.tags if card is not None else "")
+        self.tag_editor = TagEditor(card.tags if card is not None else "", suggestions=tag_suggestions)
         original.addWidget(self.tag_editor)
         original.addSpacing(3)
         original.addWidget(label("Вложения", "sectionTitle"))
@@ -318,6 +320,8 @@ class CardDialog(QDialog):
             field = DocumentTypeBox(kinds, value)
         else:
             field = QLineEdit(value)
+            if key == "expires":
+                field.setPlaceholderText("ДД.ММ.ГГГГ")
         field.setAccessibleName(title)
         self.inputs[key] = field
         layout = QVBoxLayout()
@@ -341,6 +345,8 @@ class CardDialog(QDialog):
             return
         self.pdf = data
         self.pdf_name = path.name
+        if not self.inputs["title"].text().strip():
+            self.inputs["title"].setText(path.stem)
         self.refresh_attachments()
 
     def choose_photos(self) -> None:
@@ -363,6 +369,8 @@ class CardDialog(QDialog):
                 QMessageBox.warning(self, "Не удалось добавить фото", f"{path.name}\n{exc}")
                 return
         self.photos = (*self.photos, *photos)
+        if len(filenames) == 1 and not self.inputs["title"].text().strip():
+            self.inputs["title"].setText(Path(filenames[0]).stem)
         self.refresh_attachments()
 
     def refresh_attachments(self) -> None:
@@ -394,6 +402,8 @@ class CardDialog(QDialog):
         }
         card = Card(**values, tags=self.tag_editor.value(), pdf=self.pdf, photos=self.photos)
         try:
+            if card.expires and card.expires != self.original_expiry and document_deadline(card.expires) is None:
+                raise ValueError("Введите срок действия в формате ДД.ММ.ГГГГ или оставьте поле пустым.")
             card.validate()
         except ValueError as exc:
             self.problem.setText(str(exc))
@@ -404,14 +414,14 @@ class CardDialog(QDialog):
 
 
 class TagDialog(QDialog):
-    def __init__(self, parent, existing: str):
+    def __init__(self, parent, existing: str, suggestions=()):
         super().__init__(parent)
         self.setWindowTitle("Теги документа")
         self.setMinimumWidth(360)
         layout = QVBoxLayout(self)
         layout.setContentsMargins(22, 20, 22, 20)
         layout.addWidget(label("Теги документа", "screenTitle"))
-        self.editor = TagEditor(existing)
+        self.editor = TagEditor(existing, suggestions=suggestions)
         layout.addWidget(self.editor)
         actions = QHBoxLayout()
         actions.addStretch(1)
@@ -594,6 +604,8 @@ class ArchiveWindow(QMainWindow):
         layout.addWidget(splitter, 1)
         self.find_shortcut = QShortcut(QKeySequence(QKeySequence.StandardKey.Find), self)
         self.find_shortcut.activated.connect(self.search.setFocus)
+        self.new_shortcut = QShortcut(QKeySequence(QKeySequence.StandardKey.New), self)
+        self.new_shortcut.activated.connect(self.save_card)
         self.show_catalog(None)
 
     def build_sidebar(self) -> QFrame:
@@ -620,19 +632,15 @@ class ArchiveWindow(QMainWindow):
         layout.addWidget(button("Новый архив…", lambda: self.create_archive(False), sidebar=True))
         self.finance_button = button("Финансы…", self.open_finance, sidebar=True)
         layout.addWidget(self.finance_button)
+        self.import_button = button("Импорт выписки…", self.quick_import, sidebar=True)
+        layout.addWidget(self.import_button)
         self.folders_button = button("Бумажные папки…", self.open_folders, sidebar=True)
         layout.addWidget(self.folders_button)
         self.assets_button = button("Счета и активы…", self.open_registry, sidebar=True)
         layout.addWidget(self.assets_button)
-        self.operations_button = button("Выписки и операции…", self.open_operations, sidebar=True)
-        layout.addWidget(self.operations_button)
-        self.review_button = button("Разбор операций…", self.open_review, sidebar=True)
-        layout.addWidget(self.review_button)
-        self.funds_button = button("Фонды и цели…", self.open_funds, sidebar=True)
-        layout.addWidget(self.funds_button)
         layout.addSpacing(12)
         layout.addWidget(label("ТЕГИ", "sideSection"))
-        self.all_documents = button("Все документы", lambda: self.set_tag(""), sidebar=True)
+        self.all_documents = button("Все документы", self.clear_filters, sidebar=True)
         self.all_documents.setCheckable(True)
         layout.addWidget(self.all_documents)
         self.no_tags = label("Теги появятся после добавления в карточку.", "sideCaption", wrap=True)
@@ -690,6 +698,10 @@ class ArchiveWindow(QMainWindow):
         self.count = label(style="count")
         header.addWidget(self.count)
         layout.addLayout(header)
+        self.deadlines_filter = button("Истекают и просрочены", self.toggle_deadlines)
+        self.deadlines_filter.setCheckable(True)
+        self.deadlines_filter.setToolTip("Документы с истёкшим сроком или сроком в ближайшие 30 дней")
+        layout.addWidget(self.deadlines_filter, alignment=Qt.AlignmentFlag.AlignLeft)
         self.rows = QListWidget()
         self.rows.setAccessibleName("Список документов")
         self.rows.setSpacing(3)
@@ -717,6 +729,8 @@ class ArchiveWindow(QMainWindow):
         layout.addWidget(self.card_title)
         self.card_type = label(style="muted", wrap=True)
         layout.addWidget(self.card_type)
+        self.deadline = label(style="deadlineSoon", wrap=True)
+        layout.addWidget(self.deadline)
         chips = QWidget()
         self.card_tags = TagFlow(chips)
         layout.addWidget(chips)
@@ -836,6 +850,7 @@ class ArchiveWindow(QMainWindow):
     def show_catalog(self, catalog: Catalog | None) -> None:
         self.catalog = catalog
         self.active_tag = ""
+        self.deadlines_filter.setChecked(False)
         self.archive_name.setText(
             f"{SCOPES[catalog.scope]} · {catalog.path.name}" if catalog is not None else "Архив не открыт"
         )
@@ -848,10 +863,8 @@ class ArchiveWindow(QMainWindow):
         self.search.setEnabled(catalog is not None)
         self.folders_button.setEnabled(catalog is not None)
         self.assets_button.setEnabled(catalog is not None)
-        self.operations_button.setEnabled(catalog is not None)
         self.finance_button.setEnabled(catalog is not None)
-        self.review_button.setEnabled(catalog is not None)
-        self.funds_button.setEnabled(catalog is not None)
+        self.import_button.setEnabled(catalog is not None and catalog.editable)
         self.add_button.setEnabled(catalog is not None and catalog.editable)
         self.search.blockSignals(True)
         self.search.clear()
@@ -875,12 +888,6 @@ class ArchiveWindow(QMainWindow):
         if result == QDialog.DialogCode.Accepted and dialog.document_number is not None:
             self.show_document(dialog.document_number)
 
-    def open_operations(self) -> None:
-        if self.catalog is not None:
-            dialog = LedgerDialog(self, self.catalog)
-            dialog.exec()
-            self.catalog = dialog.catalog
-
     def open_finance(self) -> None:
         if self.catalog is not None:
             dialog = FinanceDialog(self, self.catalog)
@@ -889,15 +896,14 @@ class ArchiveWindow(QMainWindow):
             if dialog.document_number is not None:
                 self.show_document(dialog.document_number)
 
-    def open_review(self) -> None:
-        if self.catalog is not None:
-            dialog = ReviewDialog(self, self.catalog)
-            dialog.exec()
-            self.catalog = dialog.catalog
-
-    def open_funds(self) -> None:
-        if self.catalog is not None:
-            dialog = FundsDialog(self, self.catalog)
+    def quick_import(self) -> None:
+        if self.catalog is None or not self.catalog.editable:
+            return
+        original = self.catalog
+        self.catalog = import_statements(self, original)
+        if self.catalog is not original:
+            dialog = FinanceDialog(self, original, show_operations=True)
+            dialog.show_posted(self.catalog)
             dialog.exec()
             self.catalog = dialog.catalog
 
@@ -909,6 +915,7 @@ class ArchiveWindow(QMainWindow):
         if index is None:
             return
         self.active_tag = ""
+        self.deadlines_filter.setChecked(False)
         self.search.blockSignals(True)
         self.search.clear()
         self.search.blockSignals(False)
@@ -918,7 +925,7 @@ class ArchiveWindow(QMainWindow):
     def refresh_sidebar_tags(self) -> None:
         tags = self.catalog.available_tags if self.catalog is not None else ()
         self.active_tag = next((tag for tag in tags if tag.casefold() == self.active_tag.casefold()), "")
-        self.all_documents.setChecked(not self.active_tag)
+        self.all_documents.setChecked(not self.active_tag and not self.deadlines_filter.isChecked())
         self.no_tags.setVisible(self.catalog is not None and not tags)
         clear_tags(self.sidebar_tags)
         for name in tags:
@@ -936,13 +943,31 @@ class ArchiveWindow(QMainWindow):
         self.refresh_sidebar_tags()
         self.refresh_list()
 
+    def clear_filters(self) -> None:
+        self.deadlines_filter.setChecked(False)
+        self.search.blockSignals(True)
+        self.search.clear()
+        self.search.blockSignals(False)
+        self.set_tag("")
+
+    def toggle_deadlines(self) -> None:
+        self.refresh_sidebar_tags()
+        self.refresh_list(-1 if self.deadlines_filter.isChecked() else None)
+
     def refresh_list(self, preferred: int | None = None) -> None:
         if preferred is None:
             preferred = self.selected_index()
         self.rows.blockSignals(True)
         self.rows.clear()
         cards = self.catalog.cards if self.catalog is not None else ()
-        for index, card in enumerate(cards):
+        limit = date.today() + timedelta(days=30)
+        deadlines = {index: deadline for index, card in enumerate(cards)
+                     if card.expires and (deadline := document_deadline(card.expires)) is not None and deadline <= limit}
+        self.deadlines_filter.setText(f"Истекают и просрочены · {len(deadlines)}")
+        self.deadlines_filter.setVisible(bool(deadlines) or self.deadlines_filter.isChecked())
+        order = sorted(deadlines, key=deadlines.get) if self.deadlines_filter.isChecked() else range(len(cards))
+        for index in order:
+            card = cards[index]
             if not card.matches(self.search.text(), tag=self.active_tag):
                 continue
             item = QListWidgetItem()
@@ -962,7 +987,8 @@ class ArchiveWindow(QMainWindow):
         if current is not None:
             self.rows.scrollToItem(current)
         self.rows.blockSignals(False)
-        self.list_title.setText(self.active_tag or "Все документы")
+        self.list_title.setText(self.active_tag or ("По сроку действия" if self.deadlines_filter.isChecked()
+                                                    else "Все документы"))
         self.count.setText(str(self.rows.count()) if self.catalog is not None else "")
         self.count.setVisible(self.catalog is not None)
         self.rows.setVisible(bool(self.rows.count()))
@@ -970,6 +996,8 @@ class ArchiveWindow(QMainWindow):
             empty = "Откройте или создайте архив"
         elif not cards:
             empty = "Добавьте первый документ"
+        elif self.deadlines_filter.isChecked():
+            empty = "Нет документов с ближайшим или истёкшим сроком по выбранным фильтрам."
         else:
             empty = "Документы не найдены"
         self.list_empty.setText(empty)
@@ -990,6 +1018,7 @@ class ArchiveWindow(QMainWindow):
         self.change_card.setVisible(editable)
         self.number.setVisible(card is not None)
         self.card_type.setVisible(card is not None and bool(card.kind))
+        self.deadline.hide()
         clear_tags(self.card_tags)
         if card is None:
             self.card_title.setText("Откройте архив" if self.catalog is None else "Документ")
@@ -1000,6 +1029,12 @@ class ArchiveWindow(QMainWindow):
         self.number.setText(f"№ {card.archive_label}")
         self.card_title.setText(card.title)
         self.card_type.setText(card.kind)
+        if card.expires and (deadline := document_deadline(card.expires)) is not None:
+            days = (deadline - date.today()).days
+            if days <= 30:
+                self.deadline.setText(f"Срок истёк {deadline:%d.%m.%Y}" if days < 0
+                                      else "Срок истекает сегодня" if days == 0 else f"Истекает {deadline:%d.%m.%Y}")
+                self.deadline.show()
         for name in tag_names(card.tags):
             chip = tag_button(name)
             chip.clicked.connect(lambda _, name=name: self.set_tag(name))
@@ -1026,7 +1061,7 @@ class ArchiveWindow(QMainWindow):
         if edit and index is None:
             return
         card = self.catalog.cards[index] if index is not None else None
-        dialog = CardDialog(self, self.catalog.available_kinds, card)
+        dialog = CardDialog(self, self.catalog.available_kinds, card, tag_suggestions=self.catalog.available_tags)
         if dialog.exec() != QDialog.DialogCode.Accepted or dialog.card is None:
             return
         try:
@@ -1043,6 +1078,10 @@ class ArchiveWindow(QMainWindow):
             self.search.blockSignals(True)
             self.search.clear()
             self.search.blockSignals(False)
+        if self.deadlines_filter.isChecked():
+            deadline = document_deadline(self.catalog.cards[index].expires)
+            if deadline is None or deadline > date.today() + timedelta(days=30):
+                self.deadlines_filter.setChecked(False)
         self.refresh_sidebar_tags()
         self.refresh_list(index)
 
@@ -1051,7 +1090,7 @@ class ArchiveWindow(QMainWindow):
         if index is None or self.catalog is None or not self.catalog.editable:
             return
         existing = self.catalog.cards[index].tags
-        dialog = TagDialog(self, existing)
+        dialog = TagDialog(self, existing, self.catalog.available_tags)
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
         value = dialog.editor.value()
