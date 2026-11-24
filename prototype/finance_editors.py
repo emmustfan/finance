@@ -48,24 +48,21 @@ def form_dialog(dialog, title, caption="Сохранить"):
 
 
 class WalletEditor(QDialog):
-    def __init__(self, parent, catalog, *, stage=False, title="", bank="", currency="RUB",
-                 opening_from_pdf=False, opening_required=False, snapshot_day=None):
+    def __init__(self, parent, catalog, *, stage=False, opening_required=False, snapshot_day=None):
         super().__init__(parent)
         self.catalog = catalog
         self.stage = stage
-        self.bank = bank
         self.opening_required = opening_required
         form, self.error = form_dialog(self, "Новый кошелёк или счёт")
-        self.title = QLineEdit(title)
+        self.title = QLineEdit()
         self.title.setPlaceholderText("Например, Наличные или Карта")
         self.kind = ChoiceBox()
         self.kind.addItems(("Наличные", "Текущий счёт", "Накопительный счёт", "Вклад", "Счёт ИП"))
         self.owner = QLineEdit("Семья" if catalog.scope == "family" else "Я")
         if stage:
             self.kind.setCurrentText("Текущий счёт")
-        self.currency = QLineEdit(currency)
+        self.currency = QLineEdit("RUB")
         self.currency.setMaxLength(3)
-        self.currency.setReadOnly(opening_from_pdf)
         self.amount = QLineEdit()
         self.amount.setPlaceholderText("Укажите сумму, можно 0" if opening_required else "По желанию")
         self.snapshot = date_field(snapshot_day or (date.today() - timedelta(days=1)).isoformat())
@@ -74,8 +71,6 @@ class WalletEditor(QDialog):
             ("Валюта", self.currency), ("Остаток на конец дня", self.amount), ("Дата остатка", self.snapshot),
         ):
             form.addRow(text, field)
-        form.setRowVisible(self.amount, not opening_from_pdf)
-        form.setRowVisible(self.snapshot, not opening_from_pdf)
         self.title.selectAll()
         self.title.setFocus()
 
@@ -85,8 +80,7 @@ class WalletEditor(QDialog):
             if self.opening_required and amount is None:
                 raise ValueError("Для CSV укажите начальный остаток, в том числе нулевой.")
             account = Asset(self.title.text().strip(), "account", self.owner.text().strip(),
-                            kind=self.kind.currentText(), organization=self.bank,
-                            currency=self.currency.text().strip().upper(),
+                            kind=self.kind.currentText(), currency=self.currency.text().strip().upper(),
                             amount=amount, as_of=field_date(self.snapshot) if amount is not None else "")
             if self.stage:
                 account.validate(set())

@@ -1,8 +1,10 @@
 import unittest
+from pathlib import Path
+from tempfile import TemporaryDirectory
 from unittest.mock import Mock, patch
 
 from assets import Asset
-from bank_pdf import _modulbank, _ozon, _tbank
+from bank_pdf import _modulbank, _ozon, _tbank, read_pdf_statements
 from ledger import Ledger, Opening, prepare_statement_account, preview_import
 
 RUB_ACCOUNT = "40817810000000000001"
@@ -87,3 +89,32 @@ class BankPdfTest(unittest.TestCase):
             geometry.get_charbox.side_effect = reversed(geom)
             with self.assertRaisesRegex(ValueError, "не сходятся"):
                 _modulbank([(page, sections[0])])[0].statement("bad.pdf", "dummy")
+
+    def test_pdf_without_movements_keeps_account_reference_and_balances(self):
+        text = f"""Дата: 01.11.2026 - 30.11.2026
+БИК 000000001 Счёт-копилка № {RUB_ACCOUNT} (RUR)
+Обороты Приход Расход
+Итого оборотов: 0,00 0,00
+Средства на конец периода (сальдо исходящее): 2 450,00
+"""
+        with TemporaryDirectory() as directory, patch("bank_pdf.pdfium.PdfDocument") as open_pdf:
+            path = Path(directory) / "idle.pdf"
+            path.write_bytes(b"synthetic bank fixture")
+            document = open_pdf.return_value.__enter__.return_value
+            document.__len__.return_value = 1
+            document[0].get_textpage.return_value.get_text_range.return_value = text
+            statement, = read_pdf_statements(path)
+
+        self.assertEqual(statement.account_label, "Счёт-копилка")
+        self.assertEqual(statement.rows, ())
+        mapping = statement.suggested_columns()
+        self.assertEqual(statement.reference(mapping), RUB_ACCOUNT)
+        asset = Asset("Копилка", "account", "Семья", asset_number=1)
+        opening = prepare_statement_account(Ledger(), asset, statement)
+        self.assertEqual(opening.opening(1), Opening(1, "2026-10-31", 245_000, "RUB", RUB_ACCOUNT))
+        ledger = preview_import(opening, 1, statement, mapping).apply(opening, set())
+        ledger.validate((asset,))
+        self.assertEqual(ledger.entries, ())
+        self.assertEqual(ledger.balance_on(1, "2026-11-30"), 245_000)
+        self.assertEqual(ledger.balances[0].amount, 245_000)
+        self.assertEqual(preview_import(ledger, 1, statement, mapping).apply(ledger, set()), ledger)

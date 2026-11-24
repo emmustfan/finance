@@ -460,7 +460,8 @@ class FinanceDialog(QDialog):
         self.tabs.addTab(self.analytics, "Аналитика")
         self.operation_page = self.build_operations()
         self.tabs.addTab(self.operation_page, "Операции")
-        self.tabs.addTab(self.build_wallets(), "Кошельки и цели")
+        self.wallet_page = self.build_wallets()
+        self.tabs.addTab(self.wallet_page, "Кошельки и цели")
         self.debt_panel = DebtPanel(self)
         self.debt_panel.catalog_changed.connect(self.updated_debt)
         self.debt_panel.report_requested.connect(lambda number: self.open_graph("debt", subject=number))
@@ -961,9 +962,12 @@ class FinanceDialog(QDialog):
             self.show_posted(dialog.catalog)
 
     def show_posted(self, catalog):
+        added_accounts = len(catalog.assets) > len(self.catalog.assets)
         entries = catalog.ledger.entries[len(self.catalog.ledger.entries):]
         if not entries:
-            self.use_catalog(catalog)
+            self.use_catalog(catalog, currency=catalog.assets[-1].currency if added_accounts else None)
+            if added_accounts:
+                self.tabs.setCurrentWidget(self.wallet_page)
             return
         self.article_filter = None
         self.operation_account = None
@@ -984,7 +988,7 @@ class FinanceDialog(QDialog):
             self.start.blockSignals(False)
             self.end.blockSignals(False)
             self.custom_dates()
-        self.tabs.setCurrentWidget(self.operation_page)
+        self.tabs.setCurrentWidget(self.wallet_page if added_accounts else self.operation_page)
 
     def import_files(self):
         updated = import_statements(self, self.catalog)

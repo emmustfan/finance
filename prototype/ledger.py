@@ -218,6 +218,8 @@ class Statement:
         return mapping
 
     def reference(self, mapping: dict[str, int]) -> str:
+        if self.opening_hint is not None:
+            return self.opening_hint[3]
         column = mapping.get("account")
         if column is None:
             return ""

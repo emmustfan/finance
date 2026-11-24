@@ -105,6 +105,7 @@ class ImportDialog(QDialog):
         self.initial_catalog = catalog
         self.result_catalog = catalog
         self.is_pdf = statement.opening_hint is not None
+        self.new_pdf_account = None
         self.batch = batch
         self.preview = None
         self.articles = {}
@@ -117,7 +118,8 @@ class ImportDialog(QDialog):
         self.transfer_intents = {}
         self.pending_openings = {}
         self.setWindowTitle("Импорт выписки")
-        self.resize(1110, 700)
+        width, height = (1110, 700) if statement.rows else (690, 250)
+        self.resize(width, height)
         layout = QVBoxLayout(self)
         layout.setContentsMargins(20, 16, 20, 16)
         layout.addWidget(label(statement.name, "screenTitle", wrap=True))
@@ -128,7 +130,10 @@ class ImportDialog(QDialog):
                                    f"{statement.bank} · Счёт •{reference[-4:]} · {currency}", "muted"))
         if position is not None:
             number, total = position
-            layout.addWidget(label(f"Шаг {number} из {total} · Все выписки сохранятся вместе", "muted"))
+            layout.addWidget(label(
+                f"Раздел {number} из {total} · Счета и операции сохранятся после подтверждения всех разделов",
+                "muted", wrap=True,
+            ))
 
         account_row = QHBoxLayout()
         self.account = ChoiceBox()
@@ -168,7 +173,9 @@ class ImportDialog(QDialog):
             account_row.addWidget(change_columns)
             layout.addWidget(self.mapping_panel)
 
-        controls = QHBoxLayout()
+        controls_panel = QWidget()
+        controls = QHBoxLayout(controls_panel)
+        controls.setContentsMargins(0, 0, 0, 0)
         self.filter = ChoiceBox()
         for key, title in (("all", "Все строки"), ("unclassified", "Без статьи"), ("expense", "Списания"),
                            ("income", "Поступления"), ("transfer", "Переводы и подсказки"),
@@ -186,7 +193,8 @@ class ImportDialog(QDialog):
         controls.addWidget(self.tags_button)
         self.whole_tag_button = button("Тег на всю выписку…", self.whole_tags)
         controls.addWidget(self.whole_tag_button)
-        layout.addLayout(controls)
+        layout.addWidget(controls_panel)
+        controls_panel.setVisible(bool(statement.rows))
 
         self.grid = table(("Статус", "Дата", "Описание", "Сумма", "Вид  ▾", "Статья / направление", "Теги  ▾"),
                           self.DESCRIPTION)
@@ -203,6 +211,7 @@ class ImportDialog(QDialog):
         self.shortcut = QShortcut(QKeySequence("F2"), self.grid)
         self.shortcut.activated.connect(self.selected_article)
         layout.addWidget(self.grid, 1)
+        self.grid.setVisible(bool(statement.rows))
         self.summary = label(style="sectionTitle", wrap=True)
         self.setup = label(style="muted", wrap=True)
         self.balance = label(style="muted", wrap=True)
@@ -211,7 +220,8 @@ class ImportDialog(QDialog):
         actions = QHBoxLayout()
         actions.addStretch(1)
         actions.addWidget(button("Отменить импорт", self.reject))
-        self.apply_button = button("Подтвердить выписку", self.apply, primary=True)
+        caption = "Далее" if position is not None and position[0] < position[1] else "Подтвердить импорт"
+        self.apply_button = button(caption, self.apply, primary=True)
         actions.addWidget(self.apply_button)
         layout.addLayout(actions)
 
@@ -224,23 +234,36 @@ class ImportDialog(QDialog):
         currency = self.statement.opening_hint[2] if self.is_pdf else None
         self.accounts = {asset.asset_number: asset for asset in self.catalog.assets
                          if asset.category == "account" and (currency is None or asset.currency == currency)}
-        self.account.blockSignals(True)
-        self.account.clear()
-        self.account.addItem("Выберите счёт", None)
-        for number, asset in self.accounts.items():
-            self.account.addItem(f"{asset.title} · {asset.owner} · {asset.currency}", number)
-        self.account.insertSeparator(self.account.count())
-        self.account.addItem("+ Новый счёт…", NEW_ACCOUNT)
         if selected is None:
             reference = self.statement.reference(self.suggested)
             matches = [item.account for item in self.catalog.ledger.openings
                        if item.account in self.accounts and reference_matches(reference, item.reference)]
             if len(matches) == 1:
                 selected = matches[0]
-            elif not self.accounts:
-                self.account.setItemText(0, "Создайте счёт для выписки")
+            elif self.is_pdf and not matches:
+                if self.new_pdf_account is None:
+                    kind = ("Накопительный счёт" if "копилка" in self.statement.account_label.casefold()
+                            else "Текущий счёт")
+                    owner = "Семья" if self.catalog.scope == "family" else "Я"
+                    self.catalog = self.catalog.stage_asset(Asset(
+                        statement_account_title(self.statement), "account", owner, kind=kind,
+                        organization=self.statement.bank, currency=currency,
+                    ))
+                    asset = self.catalog.assets[-1]
+                    self.accounts[asset.asset_number] = asset
+                    self.new_pdf_account = asset.asset_number
+                selected = self.new_pdf_account
             elif len(self.accounts) == 1 and not reference:
                 selected = next(iter(self.accounts))
+        self.account.blockSignals(True)
+        self.account.clear()
+        self.account.addItem("Выберите счёт" if self.accounts else "Создайте счёт для выписки", None)
+        for number, asset in self.accounts.items():
+            state = " · будет создан" if number == self.new_pdf_account else ""
+            self.account.addItem(f"{asset.title} · {asset.owner} · {asset.currency}{state}", number)
+        if not self.is_pdf:
+            self.account.insertSeparator(self.account.count())
+            self.account.addItem("+ Новый счёт…", NEW_ACCOUNT)
         self.account.setCurrentIndex(max(0, self.account.findData(selected)))
         self.account.blockSignals(False)
         self.selected_account = selected
@@ -265,25 +288,16 @@ class ImportDialog(QDialog):
 
     def account_changed(self):
         if self.account.currentData() == NEW_ACCOUNT:
-            title, bank, currency = "", "", "RUB"
-            if self.is_pdf:
-                _, _, currency, reference = self.statement.opening_hint
-                bank = self.statement.bank
-                title = statement_account_title(self.statement)
-            dialog = WalletEditor(self, self.catalog, stage=True, title=title, bank=bank, currency=currency,
-                                  opening_from_pdf=self.is_pdf, opening_required=not self.is_pdf,
-                                  snapshot_day=None if self.is_pdf else self.csv_snapshot_day())
-            if "копилка" in self.statement.account_label.casefold():
-                dialog.kind.setCurrentText("Накопительный счёт")
+            dialog = WalletEditor(self, self.catalog, stage=True, opening_required=True,
+                                  snapshot_day=self.csv_snapshot_day())
             if dialog.exec() != QDialog.DialogCode.Accepted:
                 self.fill_accounts(self.selected_account)
                 return
             self.catalog = dialog.catalog
             asset = self.catalog.assets[-1]
-            if not self.is_pdf:
-                self.pending_openings[asset.asset_number] = Opening(
-                    asset.asset_number, asset.as_of, asset.amount, asset.currency, self.statement.reference(self.mapping())
-                )
+            self.pending_openings[asset.asset_number] = Opening(
+                asset.asset_number, asset.as_of, asset.amount, asset.currency, self.statement.reference(self.mapping())
+            )
             self.fill_accounts(asset.asset_number)
         self.selected_account = self.account.currentData()
         self.build_preview()
@@ -394,7 +408,7 @@ class ImportDialog(QDialog):
         reference_by_number = {item.account: item.reference for item in openings}
         choices = {
             asset.asset_number: (asset.title, reference_by_number.get(asset.asset_number, ""))
-            for asset in self.catalog.assets
+            for asset in self.initial_catalog.assets
             if asset.category == "account" and asset.currency == origin.currency and asset.asset_number != account
         }
         for statement in self.batch:
@@ -503,6 +517,10 @@ class ImportDialog(QDialog):
         self.suggest_button.setText(f"Принять подсказки · {hints}" if hints else "Принять подсказки")
         if self.preview is None:
             return
+        if not self.statement.rows:
+            self.summary.setText("За этот период на счёте не было операций.")
+            self.apply_button.setEnabled(True)
+            return
         counts = Counter(row.state for row in self.preview.rows)
         transfers = sum(self.transfer_for(row.line) is not None for row in included)
         remaining = sum(self.transfer_for(row.line) is None and not self.articles.get(row.line) for row in included)
@@ -513,7 +531,6 @@ class ImportDialog(QDialog):
                                                                    ("error", "ошибки")) if counts[key])
         self.summary.setText(" · ".join(summary))
         self.apply_button.setEnabled(not self.is_pdf or not counts["error"])
-        self.apply_button.setText("Подтвердить выписку" if included or counts["error"] else "Готово")
 
     def show_balance(self):
         check = self.preview.balance

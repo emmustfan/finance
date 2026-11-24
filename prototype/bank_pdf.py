@@ -262,7 +262,7 @@ def read_pdf_statements(path: Path) -> tuple[Statement, ...]:
                 sections = _ozon([text for _, text in pages])
             elif "Выписка по договору" in first and "обработки" in first and "в валюте счёта" in first:
                 sections = _tbank([text for _, text in pages])
-            elif "сальдо входящее" in first and M_REF.search(first) and "Обороты Приход Расход" in first:
+            elif M_REF.search(first) and "Обороты Приход Расход" in first:
                 sections = _modulbank(pages)
             else:
                 raise ValueError("Формат PDF не распознан. Поддерживаются проверенные текстовые выписки трёх банков.")
@@ -270,11 +270,7 @@ def read_pdf_statements(path: Path) -> tuple[Statement, ...]:
             statements = []
             for section in sections:
                 title = path.name if len(sections) == 1 else f"{path.name} · счёт •{section.account[-4:]}"
-                statement = section.statement(title, digest)
-                if statement.rows:
-                    statements.append(statement)
-            if not statements:
-                raise ValueError("В PDF нет операций для импорта.")
+                statements.append(section.statement(title, digest))
             return tuple(statements)
     except pdfium.PdfiumError as exc:
         raise ValueError("PDF не удалось открыть. Выберите обычный PDF без пароля.") from exc
