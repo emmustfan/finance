@@ -310,9 +310,17 @@ class Catalog:
 
     @classmethod
     def open(cls, path: Path, password: str) -> "Catalog":
+        return cls._open(path, lambda data: UnlockedVault.open(data, password))
+
+    @classmethod
+    def open_with_key(cls, path: Path, key: bytes) -> "Catalog":
+        return cls._open(path, lambda data: UnlockedVault.open_with_key(data, key))
+
+    @classmethod
+    def _open(cls, path: Path, unlock) -> "Catalog":
         path = path.resolve()
         data = read_container(path)
-        unlocked, magic, payload = UnlockedVault.open(data, password)
+        unlocked, magic, payload = unlock(data)
         if magic == MAGIC:
             return cls(path, (Card("Тестовый документ", pdf=payload, archive_number=1),),
                        hashlib.sha256(data).digest(), unlocked)
@@ -336,6 +344,10 @@ class Catalog:
         group = group_for_directory(path) if scope == "family" else None
         _write_new(path, data, group=group)
         return cls(path, cards, hashlib.sha256(data).digest(), unlocked, assets, ledger, review, funds, scope, directory)
+
+    @property
+    def archive_salt(self) -> bytes:
+        return self._unlocked.salt
 
     def add(self, card: Card) -> "Catalog":
         number = max((existing.archive_number for existing in self.cards), default=0) + 1

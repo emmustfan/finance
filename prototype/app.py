@@ -13,7 +13,7 @@ from PySide6.QtCore import QSize, Qt, QTimer
 from PySide6.QtGui import QAction, QKeySequence, QPixmap, QShortcut, QTextDocument
 from PySide6.QtPrintSupport import QPrintDialog, QPrinter
 from PySide6.QtWidgets import (
-    QAbstractItemView, QApplication, QComboBox, QDialog, QFileDialog, QFrame,
+    QAbstractItemView, QApplication, QCheckBox, QComboBox, QDialog, QFileDialog, QFrame,
     QHBoxLayout, QHeaderView, QInputDialog,
     QLineEdit, QListWidget, QListWidgetItem, QMainWindow, QMenu, QMessageBox,
     QSizePolicy, QSplitter, QTableWidget, QTableWidgetItem,
@@ -34,9 +34,11 @@ from ledger import Ledger, Opening
 from ledger_views import import_statements
 from review import Recurring, Review
 from sample import sample_pdf
-from vault import copy_verified
+from touch_id import TouchID
+from vault import copy_verified, derive_archive_key, read_archive_salt
 
 VAULT_FILTER = "Семейный архив (*.fvault)"
+PASSWORD_ERROR = "Неверный пароль или нарушена целостность архива."
 
 
 class AttachmentPreview(QFrame):
@@ -567,10 +569,83 @@ class FolderDialog(QDialog):
             self.printable_inventory().print_(printer)
 
 
+class ArchiveUnlockDialog(QDialog):
+    def __init__(self, parent, path: Path, salt: bytes, touch_id: TouchID):
+        super().__init__(parent)
+        self.path = path
+        self.salt = salt
+        self.touch_id = touch_id
+        self.catalog = None
+        configured = touch_id.configured(salt)
+        self.setWindowTitle("Открыть архив")
+        self.setMinimumWidth(505)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(22, 18, 22, 18)
+        layout.addWidget(label(path.name, "screenTitle", wrap=True))
+        self.password_field = QLineEdit()
+        self.password_field.setEchoMode(QLineEdit.EchoMode.Password)
+        self.password_field.setPlaceholderText("Пароль архива")
+        self.password_field.setAccessibleName("Пароль архива")
+        self.password_field.returnPressed.connect(self.open_by_password)
+        layout.addWidget(self.password_field)
+        self.enroll = QCheckBox("Включить Touch ID для этого архива на этом Mac")
+        self.enroll.setVisible(not configured)
+        layout.addWidget(self.enroll)
+        self.problem = label(style="financeError", wrap=True)
+        self.problem.hide()
+        layout.addWidget(self.problem)
+        actions = QHBoxLayout()
+        actions.addStretch(1)
+        actions.addWidget(button("Отмена", self.reject))
+        actions.addWidget(button("Открыть по паролю", self.open_by_password, primary=not configured))
+        if configured:
+            actions.addWidget(button("Открыть с Touch ID", self.open_by_touch_id, primary=True))
+        layout.addLayout(actions)
+        self.password_field.setFocus()
+
+    def open_by_password(self) -> None:
+        password = self.password_field.text()
+        configure = self.enroll.isVisible() and self.enroll.isChecked()
+        try:
+            if configure:
+                key = derive_archive_key(password, self.salt)
+                self.catalog = Catalog.open_with_key(self.path, key)
+            else:
+                self.catalog = Catalog.open(self.path, password)
+        except (OSError, ValueError, InvalidTag) as exc:
+            self.show_problem(PASSWORD_ERROR if isinstance(exc, InvalidTag) else str(exc))
+            return
+        self.password_field.clear()
+        if configure:
+            try:
+                self.touch_id.enroll(self.salt, key)
+            except OSError:
+                QMessageBox.information(self, "Touch ID", "Архив открыт по паролю. Настроить Touch ID не удалось.")
+        self.accept()
+
+    def open_by_touch_id(self) -> None:
+        try:
+            self.catalog = Catalog.open_with_key(self.path, self.touch_id.unwrap(self.salt))
+        except (OSError, ValueError, InvalidTag):
+            self.enroll.setText("Настроить Touch ID заново")
+            self.enroll.show()
+            self.show_problem("Вход с Touch ID не завершён. Введите пароль архива.")
+            return
+        self.password_field.clear()
+        self.accept()
+
+    def show_problem(self, text: str) -> None:
+        self.problem.setText(text)
+        self.problem.show()
+        self.password_field.selectAll()
+        self.password_field.setFocus()
+
+
 class ArchiveWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.catalog: Catalog | None = None
+        self.touch_id = TouchID()
         self.displayed_card: Card | None = None
         self.active_tag = ""
         self.setWindowTitle("Семейный архив")
@@ -663,6 +738,7 @@ class ArchiveWindow(QMainWindow):
         menu.addSeparator()
         menu.addAction("Создать тестовый архив…", lambda: self.create_archive(True))
         menu.addAction("Создать тест фондов…", lambda: self.create_archive(True, funds_demo=True))
+        self.forget_touch_id_action = menu.addAction("Отключить Touch ID", self.forget_touch_id)
         self.close_action = QAction("Закрыть архив", self)
         self.close_action.triggered.connect(lambda: self.show_catalog(None))
         menu.addAction(self.close_action)
@@ -764,7 +840,7 @@ class ArchiveWindow(QMainWindow):
 
     def error(self, exc: Exception) -> None:
         if isinstance(exc, InvalidTag):
-            detail = "Неверный пароль или нарушена целостность архива."
+            detail = PASSWORD_ERROR
         elif isinstance(exc, FileExistsError):
             detail = "Этот файл уже существует. Выберите другое имя."
         else:
@@ -837,6 +913,16 @@ class ArchiveWindow(QMainWindow):
         path = self.source_path("Открыть архив")
         if path is None:
             return
+        if self.touch_id.available():
+            try:
+                salt = read_archive_salt(path)
+            except (OSError, ValueError) as exc:
+                self.error(exc)
+                return
+            dialog = ArchiveUnlockDialog(self, path, salt, self.touch_id)
+            if dialog.exec() == QDialog.DialogCode.Accepted:
+                self.show_catalog(dialog.catalog)
+            return
         password = self.password("Введите пароль")
         if password is None:
             return
@@ -846,6 +932,16 @@ class ArchiveWindow(QMainWindow):
             self.error(exc)
             return
         self.show_catalog(catalog)
+
+    def forget_touch_id(self) -> None:
+        if self.catalog is None:
+            return
+        try:
+            self.touch_id.forget(self.catalog.archive_salt)
+        except OSError as exc:
+            self.error(exc)
+            return
+        self.forget_touch_id_action.setVisible(False)
 
     def show_catalog(self, catalog: Catalog | None) -> None:
         self.catalog = catalog
@@ -860,6 +956,7 @@ class ArchiveWindow(QMainWindow):
         )
         self.archive_hint.setVisible(bool(self.archive_hint.text()))
         self.close_action.setEnabled(catalog is not None)
+        self.forget_touch_id_action.setVisible(catalog is not None and self.touch_id.configured(catalog.archive_salt))
         self.search.setEnabled(catalog is not None)
         self.folders_button.setEnabled(catalog is not None)
         self.assets_button.setEnabled(catalog is not None)

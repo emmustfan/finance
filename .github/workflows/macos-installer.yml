@@ -4,6 +4,7 @@ on:
   push:
     tags:
       - 'finance-test-*'
+      - 'v[0-9]*'
 
 permissions:
   contents: read
@@ -29,6 +30,12 @@ jobs:
         run: |
           set -o pipefail
           sudo /usr/sbin/installer -pkg prototype/dist/FinanceArchive.pkg -target / 2>&1 | tee "${RUNNER_TEMP}/finance-install.log"
+      - name: Check the installed Touch ID helper
+        run: |
+          helper=/Applications/FinanceArchive.app/Contents/Frameworks/FinanceTouchID
+          test -x "$helper"
+          /usr/bin/codesign --verify --strict "$helper"
+          "$helper" available || test "$?" -eq 2
       - name: Launch the installed app
         run: |
           set -o pipefail
@@ -81,3 +88,36 @@ jobs:
               { printf '### %s\n\n```text\n' "$(basename "$log")"; tail -55 "$log"; printf '```\n\n'; } >> "$GITHUB_STEP_SUMMARY"
             fi
           done
+
+  release:
+    if: github.ref_type == 'tag' && startsWith(github.ref_name, 'v')
+    needs: package
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: FinanceArchive-macOS-*
+          path: installers
+      - name: Publish the macOS packages
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          version=${RELEASE_TAG#v}
+          for arch in arm64 x86_64; do
+            mv "installers/FinanceArchive-macOS-${arch}/FinanceArchive.pkg" \
+              "installers/FinanceArchive-${version}-macOS-${arch}.pkg"
+          done
+          cat > release-notes.md <<'EOF'
+          Установщики для macOS 13 и новее. Для Apple Silicon выберите **arm64**, для Intel — **x86_64**. После установки откройте **FinanceArchive** в папке «Программы».
+
+          При открытии архива по паролю на совместимом Mac можно включить Touch ID. Настройка действует в текущей учётной записи Mac. Пароль архива остаётся доступен.
+
+          Установщики выпущены без подписи Developer ID и нотарификации Apple.
+          EOF
+          gh release create "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --verify-tag \
+            --title "Семейный архив $version" --notes-file release-notes.md \
+            "installers/FinanceArchive-${version}-macOS-arm64.pkg#Скачать для Apple Silicon (.pkg)" \
+            "installers/FinanceArchive-${version}-macOS-x86_64.pkg#Скачать для Intel (.pkg)"

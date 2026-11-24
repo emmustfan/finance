@@ -7,8 +7,9 @@ from pathlib import Path
 import pypdfium2 as pdfium
 from cryptography.exceptions import InvalidTag
 
+from documents import Card, Catalog
 from sample import sample_pdf
-from vault import copy_verified, create, open_pdf
+from vault import copy_verified, create, derive_archive_key, open_pdf, read_archive_salt
 
 FAMILY_TEST_PASSWORD = "sample family password"
 PERSONAL_TEST_PASSWORD = "sample personal password"
@@ -63,6 +64,21 @@ class VaultTest(unittest.TestCase):
         with self.assertRaises(FileExistsError):
             copy_verified(self.family, destination, FAMILY_TEST_PASSWORD)
         self.assertEqual(destination.read_bytes(), b"existing")
+
+    def test_derived_archive_key_opens_legacy_archive_and_survives_edits(self):
+        salt = read_archive_salt(self.family)
+        key = derive_archive_key(FAMILY_TEST_PASSWORD, salt)
+        opened = Catalog.open_with_key(self.family, key)
+        self.assertEqual(opened.cards[0].pdf, self.pdf)
+        edited = opened.add(Card("Сохранённый документ", folder="01"))
+        self.assertEqual(read_archive_salt(self.family), salt)
+        self.assertEqual(Catalog.open_with_key(self.family, key).cards, edited.cards)
+        self.assertEqual(Catalog.open(self.family, FAMILY_TEST_PASSWORD).cards, edited.cards)
+
+        personal = self.root / "personal.fvault"
+        Catalog.create(personal, FAMILY_TEST_PASSWORD)
+        with self.assertRaises(InvalidTag):
+            Catalog.open_with_key(personal, key)
 
 
 if __name__ == "__main__":

@@ -26,9 +26,14 @@ fi
 
 "$python_command" -m venv "$runtime"
 "$runtime/bin/python" -m pip --disable-pip-version-check install --only-binary=:all: -r requirements.txt PyInstaller==6.18.0
+architecture=$("$runtime/bin/python" -c 'import platform; print(platform.machine())')
+mkdir -p build
+xcrun swiftc -parse-as-library -O -target "${architecture}-apple-macos13.0" \
+    touch_id.swift -o build/FinanceTouchID
 "$runtime/bin/python" -m PyInstaller --noconfirm --windowed \
     --name FinanceArchive --osx-bundle-identifier org.familyfinance.archive \
     --specpath build --workpath build --distpath dist \
+    --add-binary "$(pwd)/build/FinanceTouchID:." \
     --collect-all pypdfium2_raw app.py
 
 stage=$(mktemp -d)
@@ -40,5 +45,5 @@ pkgbuild --analyze --root "$payload" "$stage/components.plist"
 # Keep Installer from updating the build copy or another copy of the app on the Mac.
 /usr/libexec/PlistBuddy -c 'Set :0:BundleIsRelocatable false' "$stage/components.plist"
 pkgbuild --root "$payload" --component-plist "$stage/components.plist" --install-location /Applications \
-    --identifier org.familyfinance.archive --version 1.4.0 \
+    --identifier org.familyfinance.archive --version 1.5.0 \
     dist/FinanceArchive.pkg
